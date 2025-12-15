@@ -662,6 +662,71 @@ with tab3:
                         st.success(f"検証完了：{len(res)}日（店: {shop} / 機種: {machine}）")
                         st.dataframe(res, use_container_width=True, hide_index=True)
 
+                        # ===== 見える化（単日モードのみ）=====
+                        if mode == "単日":
+                            st.divider()
+                            st.markdown("#### 見える化（予測 vs 当たり）")
+
+                            # 単日の対象日
+                            td = target_days[0]
+
+                            # その日の予測ランキング（リークなし：直前N日で作る）
+                            ranking_single = build_ranking(
+                                df_all=df_all,
+                                shop=shop,
+                                machine=machine,
+                                base_day=td,
+                                lookback_days=int(lookback_days),
+                                tau=int(tau),
+                                min_games=int(min_games),
+                                max_rb=float(max_rb),
+                                max_gassan=float(max_gassan),
+                                min_unique_days=int(min_unique_days),
+                            )
+
+                            # 対象日の正解（当たり台）
+                            truth_set, _ = truth_good_units(
+                                df_all=df_all,
+                                shop=shop,
+                                machine=machine,
+                                target_day=td,
+                                min_games=int(min_games),
+                                max_rb=float(max_rb),
+                                max_gassan=float(max_gassan),
+                            )
+
+                            if ranking_single.empty:
+                                st.warning("この対象日は予測ランキングを作れません（学習側データ不足/サンプル不足）。")
+                            else:
+                                truth_list = sorted([int(x) for x in truth_set]) if truth_set else []
+                                st.caption(f"対象日: {td} / 当たり台（正解）: {len(truth_list)}台")
+                                st.write(truth_list if truth_list else "（当たり台が0台：閾値が厳しすぎる可能性）")
+
+                                for K in K_list:
+                                    st.markdown(f"##### K={K}")
+
+                                    pred_units = pd.to_numeric(
+                                        ranking_single.head(int(K))["unit_number"],
+                                        errors="coerce"
+                                    ).dropna().astype(int).tolist()
+
+                                    pred_set = set(pred_units)
+                                    inter = sorted(list(pred_set & truth_set))
+
+                                    col1, col2, col3 = st.columns(3)
+                                    with col1:
+                                        st.markdown("**予測 上位K台（台番）**")
+                                        st.write(pred_units if pred_units else "（なし）")
+                                    with col2:
+                                        st.markdown("**対象日の当たり台（台番）**")
+                                        st.write(truth_list if truth_list else "（なし）")
+                                    with col3:
+                                        st.markdown("**一致（台番）**")
+                                        st.write(inter if inter else "（一致なし）")
+
+                                    st.metric("hits（一致台数）", len(inter))
+
+
                         st.divider()
                         st.markdown("#### 集計（平均）")
                         summary = {}
