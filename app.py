@@ -173,6 +173,10 @@ def build_ranking(
     max_rb: float,
     max_gassan: float,
     min_unique_days: int,
+    block_size: int,
+    w_unit: float,
+    w_tail: float,
+    w_block: float,
 ):
     """
     base_day を基準に、(base_day-lookback_days)〜(base_day-1) のデータだけでランキングを作る
@@ -192,21 +196,36 @@ def build_ranking(
     if df.empty:
         return pd.DataFrame()
 
+    # 数値化
+    df["unit_number"] = pd.to_numeric(df["unit_number"], errors="coerce")
+    df = df[df["unit_number"].notna()].copy()
+    df["unit_number"] = df["unit_number"].astype(int)
+
     df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
     df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
     df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
 
+    # 末尾・台番帯
+    df["tail"] = df["unit_number"] % 10
+    bs = max(int(block_size), 1)
+    df["block"] = df["unit_number"] // bs
+
+    # 減衰重み
     df["days_ago"] = (pd.to_datetime(base_day) - pd.to_datetime(df["date"])).dt.days
     df["w"] = np.exp(-df["days_ago"] / max(int(tau), 1))
 
+    # 良台日判定（正解の定義）
     df["is_good_day"] = (
         (df["total_start_num"] >= min_games) &
         (df["rb_rate_num"] <= max_rb) &
         (df["gassan_rate_num"] <= max_gassan)
     ).astype(int)
 
+    # -------------------------
+    # ① 台単体（unit）集計
+    # -------------------------
     gcols = ["shop", "machine", "unit_number"]
-    agg = df.groupby(gcols, dropna=False).agg(
+    agg_u = df.groupby(gcols, dropna=False).agg(
         samples=("date", "count"),
         unique_days=("date", "nunique"),
         w_sum=("w", "sum"),
@@ -215,37 +234,81 @@ def build_ranking(
         avg_rb=("rb_rate_num", "mean"),
         avg_gassan=("gassan_rate_num", "mean"),
         max_total=("total_start_num", "max"),
+        tail=("tail", "first"),
+        block=("block", "first"),
     ).reset_index()
 
     # ブレ対策（サンプル不足排除）
-    agg = agg[agg["unique_days"] >= int(min_unique_days)].copy()
-    if agg.empty:
+    agg_u = agg_u[agg_u["unique_days"] >= int(min_unique_days)].copy()
+    if agg_u.empty:
         return pd.DataFrame()
 
-    agg["good_rate_weighted"] = (agg["good_w"] / agg["w_sum"]).replace([np.inf, -np.inf], np.nan)
-    agg["good_rate_simple"] = (agg["good_days"] / agg["unique_days"]).replace([np.inf, -np.inf], np.nan)
+    agg_u["good_rate_weighted"] = (agg_u["good_w"] / agg_u["w_sum"]).replace([np.inf, -np.inf], np.nan)
+    agg_u["good_rate_simple"] = (agg_u["good_days"] / agg_u["unique_days"]).replace([np.inf, -np.inf], np.nan)
 
-    # 信頼度補正（重み合計が大きいほど加点）
-    wmax = float(agg["w_sum"].max() if agg["w_sum"].notna().any() else 0.0)
-    trust = np.log1p(agg["w_sum"].fillna(0.0)) / np.log1p(wmax + 1e-9) if wmax > 0 else 0.0
+    # 信頼度（重み合計が大きいほど信頼）
+    wmax = float(agg_u["w_sum"].max() if agg_u["w_sum"].notna().any() else 0.0)
+    trust = np.log1p(agg_u["w_sum"].fillna(0.0)) / np.log1p(wmax + 1e-9) if wmax > 0 else 0.0
 
-    agg["score"] = (
-        (agg["good_rate_weighted"].fillna(0) * 100.0) * 0.70 +
+    # 台単体スコア：良台率（重み付き）＋信頼度
+    agg_u["unit_score"] = (
+        (agg_u["good_rate_weighted"].fillna(0) * 100.0) * 0.70 +
         (trust * 100.0) * 0.30
     ) / 100.0
 
+    # -------------------------
+    # ② 末尾（tail）集計
+    # -------------------------
+    agg_t = df.groupby(["shop", "machine", "tail"], dropna=False).agg(
+        t_unique_days=("date", "nunique"),
+        t_w_sum=("w", "sum"),
+        t_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
+    ).reset_index()
+    agg_t["tail_score"] = (agg_t["t_good_w"] / agg_t["t_w_sum"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # -------------------------
+    # ③ 台番帯（block）集計
+    # -------------------------
+    agg_b = df.groupby(["shop", "machine", "block"], dropna=False).agg(
+        b_unique_days=("date", "nunique"),
+        b_w_sum=("w", "sum"),
+        b_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
+    ).reset_index()
+    agg_b["block_score"] = (agg_b["b_good_w"] / agg_b["b_w_sum"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # 台単体にJOIN
+    out = agg_u.merge(agg_t[["shop","machine","tail","tail_score"]], on=["shop","machine","tail"], how="left")
+    out = out.merge(agg_b[["shop","machine","block","block_score"]], on=["shop","machine","block"], how="left")
+    out["tail_score"] = out["tail_score"].fillna(0.0)
+    out["block_score"] = out["block_score"].fillna(0.0)
+
+    # 最終スコア（勝率寄り＝場所重視）
+    out["final_score"] = (
+        out["unit_score"].fillna(0.0) * float(w_unit) +
+        out["tail_score"].fillna(0.0) * float(w_tail) +
+        out["block_score"].fillna(0.0) * float(w_block)
+    )
+
     # 表示整形
-    out = agg.copy()
     out["good_rate_weighted"] = (out["good_rate_weighted"] * 100).round(1)
     out["good_rate_simple"] = (out["good_rate_simple"] * 100).round(1)
+    out["unit_score"] = pd.to_numeric(out["unit_score"], errors="coerce").round(3)
+    out["tail_score"] = pd.to_numeric(out["tail_score"], errors="coerce").round(3)
+    out["block_score"] = pd.to_numeric(out["block_score"], errors="coerce").round(3)
+    out["final_score"] = pd.to_numeric(out["final_score"], errors="coerce").round(3)
     out["avg_rb"] = pd.to_numeric(out["avg_rb"], errors="coerce").round(1)
     out["avg_gassan"] = pd.to_numeric(out["avg_gassan"], errors="coerce").round(1)
-    out["score"] = pd.to_numeric(out["score"], errors="coerce").round(3)
 
-    out = out.sort_values(["score", "good_rate_weighted", "w_sum"], ascending=[False, False, False]).reset_index(drop=True)
+    out = out.sort_values(
+        ["final_score", "tail_score", "block_score", "unit_score", "w_sum"],
+        ascending=[False, False, False, False, False]
+    ).reset_index(drop=True)
+
     out["rank"] = np.arange(1, len(out) + 1)
     out["train_start"] = start_day
     out["train_end"] = end_day
+    out["block_size"] = int(bs)
+
     return out
 
 def truth_good_units(
@@ -334,6 +397,17 @@ with st.sidebar:
             st.caption("この機種はプリセット未登録です。手動でスライダーを調整してください。")
 
     st.divider()
+    st.header("朝イチ候補スコア（場所重視）")
+
+    block_size = st.number_input("台番帯の幅（block_size）", 5, 50, 10, 1)
+    w_tail = st.slider("末尾（tail）の重み", 0.0, 1.0, 0.5, 0.05)
+    w_block = st.slider("台番帯（block）の重み", 0.0, 1.0, 0.3, 0.05)
+
+    # 台単体の重みは残り
+    w_unit = max(0.0, 1.0 - (w_tail + w_block))
+    st.caption(f"台単体の重み（自動）: {w_unit:.2f}  ※ w_tail + w_block が 1 を超えると台単体は 0 になります")
+
+    st.divider()
     st.header("朝イチ判定（スライダー）")
 
     min_games = st.slider(
@@ -363,7 +437,7 @@ with st.sidebar:
     min_unique_days = st.number_input("最小サンプル日数（稼働日数）", 1, 60, 3, 1)
     top_n = st.number_input("上位N件表示", 1, 200, 30, 1)
 
-# --------- 共通：過去データの投入（tab1/tab3で使う） ---------
+# --------- 共通：過去データの投入（tab1で使う） ---------
 def upload_past_data_ui():
     st.caption("複数CSV（original.csv）または zip（CSVをまとめたもの）をアップロードしてください。")
     colA, colB = st.columns(2)
@@ -404,10 +478,9 @@ st.divider()
 st.subheader("共通：過去データアップロード（朝イチ候補 / 精度検証で使用）")
 df_all_shared = upload_past_data_ui()
 
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2 = st.tabs([
     "朝イチ候補（過去データ集計）",
-    "実戦ログ（CSVに追記して更新版DL）",
-    "精度検証（バックテスト）"
+    "実戦ログ（CSVに追記して更新版DL）"
 ])
 
 with tab1:
@@ -428,7 +501,12 @@ with tab1:
             max_rb=float(max_rb),
             max_gassan=float(max_gassan),
             min_unique_days=int(min_unique_days),
+            block_size=int(block_size),
+            w_unit=float(w_unit),
+            w_tail=float(w_tail),
+            w_block=float(w_block),
         )
+
 
         if ranking.empty:
             st.warning("指定した条件でランキングが作れません（データ不足/サンプル不足）。条件を緩めてください。")
@@ -436,17 +514,16 @@ with tab1:
             train_start = ranking["train_start"].iloc[0]
             train_end = ranking["train_end"].iloc[0]
             st.success(f"学習期間：{train_start}〜{train_end}（対象：{shop} / {machine}）  |  台数: {len(ranking)}")
-            st.dataframe(
-                ranking.head(int(top_n))[[
-                    "shop","machine","unit_number",
-                    "rank","score",
-                    "good_rate_weighted","good_rate_simple",
-                    "unique_days","samples","w_sum",
-                    "avg_rb","avg_gassan","max_total"
-                ]],
-                use_container_width=True,
-                hide_index=True
-            )
+            show_cols = [
+                "rank",
+                "unit_number","tail","block",
+                "final_score","unit_score","tail_score","block_score",
+                "good_rate_weighted","good_rate_simple",
+                "unique_days","samples","w_sum",
+                "avg_rb","avg_gassan","max_total",
+            ]
+            st.dataframe(ranking.head(int(top_n))[show_cols], use_container_width=True, hide_index=True)
+
 
             filename = make_filename(machine, "morning_candidates", date_str)
             st.download_button(
@@ -540,215 +617,3 @@ with tab2:
         st.markdown("#### 追記後プレビュー（末尾5行）")
         preview_df = pd.read_csv(io.BytesIO(out_bytes))
         st.dataframe(preview_df.tail(5), use_container_width=True, hide_index=True)
-
-with tab3:
-    st.subheader("③ 精度検証（バックテスト：対象日 vs 直前N日）")
-    st.caption("対象日を選び、その前N日だけで作ったランキングが、対象日の“良台日”をどれだけ当てられたかを評価します（リークなし）。")
-
-    if df_all_shared.empty:
-        st.info("上の『共通：過去データアップロード』にCSV/zipを入れてください。")
-    else:
-        df_all = df_all_shared.copy()
-        df_all = df_all[df_all["date"].notna()].copy()
-        df_all = df_all[(df_all["shop"] == shop) & (df_all["machine"] == machine)].copy()
-
-        if df_all.empty:
-            st.warning("この店×機種のデータがありません。店/機種を変えるか、データを追加してください。")
-        else:
-            # 対象日の候補範囲（データに存在する日だけ）
-            all_days = sorted(pd.Series(df_all["date"].dropna().unique()).tolist())
-            if not all_days:
-                st.warning("日付データが取得できませんでした（date列の形式を確認してください）。")
-            else:
-                min_day, max_day = all_days[0], all_days[-1]
-
-                st.markdown("#### 対象日の指定")
-                mode = st.radio("検証モード", ["単日", "期間（まとめて）"], horizontal=True)
-                K_list = st.multiselect("評価するK（上位K台）", [3,5,10,15,20,30], default=[10,20])
-
-                if mode == "単日":
-                    target_day = st.date_input("対象日", value=max_day, min_value=min_day, max_value=max_day)
-                    target_days = [pd.to_datetime(target_day).date()]
-                else:
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        target_from = st.date_input("対象期間 From", value=min_day, min_value=min_day, max_value=max_day)
-                    with c2:
-                        target_to = st.date_input("対象期間 To", value=max_day, min_value=min_day, max_value=max_day)
-
-                    target_from = pd.to_datetime(target_from).date()
-                    target_to = pd.to_datetime(target_to).date()
-                    if target_from > target_to:
-                        st.error("From と To の順序が逆です。")
-                        target_days = []
-                    else:
-                        target_days = [d for d in all_days if (d >= target_from and d <= target_to)]
-
-                st.divider()
-                st.markdown("#### 検証実行")
-
-                if st.button("この条件でバックテストする", type="primary", use_container_width=True):
-                    rows = []
-                    for td in target_days:
-                        start_train = (pd.to_datetime(td) - pd.Timedelta(days=int(lookback_days))).date()
-                        if start_train < min_day:
-                            continue
-
-                        ranking = build_ranking(
-                            df_all=df_all,
-                            shop=shop,
-                            machine=machine,
-                            base_day=td,
-                            lookback_days=int(lookback_days),
-                            tau=int(tau),
-                            min_games=int(min_games),
-                            max_rb=float(max_rb),
-                            max_gassan=float(max_gassan),
-                            min_unique_days=int(min_unique_days),
-                        )
-
-                        truth_set, total_units = truth_good_units(
-                            df_all=df_all,
-                            shop=shop,
-                            machine=machine,
-                            target_day=td,
-                            min_games=int(min_games),
-                            max_rb=float(max_rb),
-                            max_gassan=float(max_gassan),
-                        )
-
-                        if ranking.empty:
-                            rows.append({
-                                "target_day": td,
-                                "train_ok": False,
-                                "truth_good_units": len(truth_set),
-                                "total_units": total_units,
-                                "note": "学習側がデータ不足/サンプル不足",
-                            })
-                            continue
-
-                        first_hit_rank = None
-                        if truth_set:
-                            for _, r in ranking.iterrows():
-                                u = int(r["unit_number"]) if pd.notna(r["unit_number"]) else None
-                                if u in truth_set:
-                                    first_hit_rank = int(r["rank"])
-                                    break
-
-                        base = {
-                            "target_day": td,
-                            "train_ok": True,
-                            "truth_good_units": len(truth_set),
-                            "total_units": total_units,
-                            "first_hit_rank": first_hit_rank if first_hit_rank is not None else np.nan,
-                            "note": "" if truth_set else "対象日に正解台が0（閾値が厳しすぎる可能性）",
-                        }
-
-                        for K in K_list:
-                            topK_units = set(pd.to_numeric(ranking.head(int(K))["unit_number"], errors="coerce").dropna().astype(int).tolist())
-                            hits = len(topK_units & truth_set)
-                            base[f"hits@{K}"] = hits
-                            base[f"Hit@{K}"] = 1 if hits > 0 else 0
-                            base[f"P@{K}"] = round((hits / int(K)) if K > 0 else 0.0, 3)
-
-                        rows.append(base)
-
-                    res = pd.DataFrame(rows)
-
-                    if res.empty:
-                        st.warning("検証できる対象日がありません（過去何日が大きすぎる/データ期間が短い等）。")
-                    else:
-                        res = res.sort_values("target_day", ascending=False)
-                        st.success(f"検証完了：{len(res)}日（店: {shop} / 機種: {machine}）")
-                        st.dataframe(res, use_container_width=True, hide_index=True)
-
-                        # ===== 見える化（単日モードのみ）=====
-                        if mode == "単日":
-                            st.divider()
-                            st.markdown("#### 見える化（予測 vs 当たり）")
-
-                            # 単日の対象日
-                            td = target_days[0]
-
-                            # その日の予測ランキング（リークなし：直前N日で作る）
-                            ranking_single = build_ranking(
-                                df_all=df_all,
-                                shop=shop,
-                                machine=machine,
-                                base_day=td,
-                                lookback_days=int(lookback_days),
-                                tau=int(tau),
-                                min_games=int(min_games),
-                                max_rb=float(max_rb),
-                                max_gassan=float(max_gassan),
-                                min_unique_days=int(min_unique_days),
-                            )
-
-                            # 対象日の正解（当たり台）
-                            truth_set, _ = truth_good_units(
-                                df_all=df_all,
-                                shop=shop,
-                                machine=machine,
-                                target_day=td,
-                                min_games=int(min_games),
-                                max_rb=float(max_rb),
-                                max_gassan=float(max_gassan),
-                            )
-
-                            if ranking_single.empty:
-                                st.warning("この対象日は予測ランキングを作れません（学習側データ不足/サンプル不足）。")
-                            else:
-                                truth_list = sorted([int(x) for x in truth_set]) if truth_set else []
-                                st.caption(f"対象日: {td} / 当たり台（正解）: {len(truth_list)}台")
-                                st.write(truth_list if truth_list else "（当たり台が0台：閾値が厳しすぎる可能性）")
-
-                                for K in K_list:
-                                    st.markdown(f"##### K={K}")
-
-                                    pred_units = pd.to_numeric(
-                                        ranking_single.head(int(K))["unit_number"],
-                                        errors="coerce"
-                                    ).dropna().astype(int).tolist()
-
-                                    pred_set = set(pred_units)
-                                    inter = sorted(list(pred_set & truth_set))
-
-                                    col1, col2, col3 = st.columns(3)
-                                    with col1:
-                                        st.markdown("**予測 上位K台（台番）**")
-                                        st.write(pred_units if pred_units else "（なし）")
-                                    with col2:
-                                        st.markdown("**対象日の当たり台（台番）**")
-                                        st.write(truth_list if truth_list else "（なし）")
-                                    with col3:
-                                        st.markdown("**一致（台番）**")
-                                        st.write(inter if inter else "（一致なし）")
-
-                                    st.metric("hits（一致台数）", len(inter))
-
-
-                        st.divider()
-                        st.markdown("#### 集計（平均）")
-                        summary = {}
-                        valid = res[res["train_ok"] == True].copy()
-                        summary["days_tested"] = int(len(res))
-                        summary["days_train_ok"] = int(len(valid))
-                        summary["avg_truth_good_units"] = float(valid["truth_good_units"].mean()) if len(valid) else np.nan
-                        summary["avg_first_hit_rank"] = float(valid["first_hit_rank"].mean()) if len(valid) else np.nan
-
-                        for K in K_list:
-                            if f"Hit@{K}" in valid.columns:
-                                summary[f"Hit@{K}_rate"] = float(valid[f"Hit@{K}"].mean())
-                            if f"P@{K}" in valid.columns:
-                                summary[f"P@{K}_avg"] = float(valid[f"P@{K}"].mean())
-
-                        st.dataframe(pd.DataFrame([summary]), use_container_width=True, hide_index=True)
-
-                        out_name = make_filename(machine, "backtest_result", date_str)
-                        st.download_button(
-                            "バックテスト結果をCSVでダウンロード",
-                            data=to_csv_bytes(res),
-                            file_name=out_name,
-                            mime="text/csv",
-                            key="tab3_dl_backtest"
-                        )
