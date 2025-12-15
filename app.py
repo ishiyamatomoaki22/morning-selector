@@ -27,16 +27,17 @@ st.caption("過去の original.csv（複数日）をアップロード → 店×
 
 JST = ZoneInfo("Asia/Tokyo")
 
-# 機種ごとのおすすめ設定（夕方の値を流用）
+# 機種ごとのおすすめ設定（朝イチ用・候補を残す設定）
 RECOMMENDED = {
-    "マイジャグラーV":         {"min_games": 3000, "max_rb": 270.0, "max_gassan": 180.0},
-    "ゴーゴージャグラー3":     {"min_games": 3000, "max_rb": 280.0, "max_gassan": 185.0},
-    "ハッピージャグラーVIII":  {"min_games": 3500, "max_rb": 260.0, "max_gassan": 175.0},
-    "ファンキージャグラー2KT": {"min_games": 3000, "max_rb": 300.0, "max_gassan": 190.0},
-    "ミスタージャグラー":      {"min_games": 2800, "max_rb": 300.0, "max_gassan": 190.0},
-    "ジャグラーガールズSS":    {"min_games": 2500, "max_rb": 260.0, "max_gassan": 175.0},
-    "ネオアイムジャグラーEX":  {"min_games": 2500, "max_rb": 330.0, "max_gassan": 200.0},
-    "ウルトラミラクルジャグラー":{"min_games": 3500, "max_rb": 300.0, "max_gassan": 195.0},
+    # 迷ったらこのへんが無難：候補を狭めすぎない
+    "マイジャグラーV":          {"min_games": 2500, "max_rb": 290.0, "max_gassan": 195.0},
+    "ゴーゴージャグラー3":      {"min_games": 2500, "max_rb": 300.0, "max_gassan": 200.0},
+    "ハッピージャグラーVIII":   {"min_games": 3000, "max_rb": 285.0, "max_gassan": 190.0},
+    "ファンキージャグラー2KT":  {"min_games": 2500, "max_rb": 320.0, "max_gassan": 210.0},
+    "ミスタージャグラー":       {"min_games": 2300, "max_rb": 320.0, "max_gassan": 210.0},
+    "ジャグラーガールズSS":     {"min_games": 2300, "max_rb": 285.0, "max_gassan": 190.0},
+    "ネオアイムジャグラーEX":   {"min_games": 2300, "max_rb": 350.0, "max_gassan": 220.0},
+    "ウルトラミラクルジャグラー":{"min_games": 3000, "max_rb": 320.0, "max_gassan": 210.0},
 }
 
 # ========= Helpers =========
@@ -243,6 +244,7 @@ with st.sidebar:
     )
 
     lookback_days = st.number_input("集計対象：過去何日", 1, 365, 60, 1)
+    min_unique_days = st.number_input("最小サンプル日数（稼働日数）", 1, 60, 3, 1)
     tau = st.number_input("日付減衰 τ（小さいほど直近重視）", 1, 120, 14, 1)
     top_n = st.number_input("上位N件表示", 1, 200, 30, 1)
 
@@ -334,6 +336,12 @@ with tab1:
     # 指標
     agg["good_rate_weighted"] = (agg["good_w"] / agg["w_sum"]).replace([np.inf, -np.inf], np.nan)
     agg["good_rate_simple"] = (agg["good_days"] / agg["unique_days"]).replace([np.inf, -np.inf], np.nan)
+    # サンプルが少なすぎる台を除外（ブレ対策）
+    agg = agg[agg["unique_days"] >= int(min_unique_days)].copy()
+
+    if agg.empty:
+        st.warning("最小サンプル日数の条件で台が残りません。条件を緩めてください。")
+        st.stop()
 
     # 総合スコア（朝イチ用）
     # 直感的に：良台率(重み付き)を主軸 + サンプル(重み合計)で信頼度補正
