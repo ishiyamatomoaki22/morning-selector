@@ -238,11 +238,8 @@ def build_ranking(
     max_rb: float,
     max_gassan: float,
     min_unique_days: int,
-    block_size: int,
     # weights
     w_unit: float,
-    w_tail: float,
-    w_block: float,
     w_island: float,
     w_run: float,
     w_end: float,
@@ -250,6 +247,7 @@ def build_ranking(
     """
     base_day を基準に、(base_day-lookback_days)〜(base_day-1) のデータだけでランキングを作る
     ※ base_day 当日のデータは学習に使わない（リーク防止）
+    ※ 台番号のクセ（tail/block）は一切使わない（方式A）
     """
     if df_all.empty:
         return pd.DataFrame()
@@ -265,6 +263,13 @@ def build_ranking(
     if df.empty:
         return pd.DataFrame()
 
+    # 島マスタ前提（必須）
+    required_island_cols = ["island_id","side","pos","edge_type","is_end"]
+    if not all(c in df.columns for c in required_island_cols):
+        raise ValueError("島マスタ列が不足しています。過去データに島マスタをJOINしてください。")
+    if df["island_id"].isna().all():
+        raise ValueError("島マスタがJOINされていません（island_idが全て欠損）。")
+
     # 数値化
     df["unit_number"] = pd.to_numeric(df["unit_number"], errors="coerce")
     df = df[df["unit_number"].notna()].copy()
@@ -273,11 +278,6 @@ def build_ranking(
     df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
     df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
     df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
-
-    # 末尾・台番帯
-    df["tail"] = df["unit_number"] % 10
-    bs = max(int(block_size), 1)
-    df["block"] = df["unit_number"] // bs
 
     # 減衰重み（直近重視）
     df["days_ago"] = (pd.to_datetime(base_day) - pd.to_datetime(df["date"])).dt.days
@@ -289,9 +289,6 @@ def build_ranking(
         (df["rb_rate_num"] <= max_rb) &
         (df["gassan_rate_num"] <= max_gassan)
     ).astype(int)
-
-    # 島列があるか（JOINされているか）
-    has_island = all(c in df.columns for c in ["island_id","side","pos","edge_type","is_end"]) and df["island_id"].notna().any()
 
     # -------------------------
     # ① 台単体（unit）集計
@@ -306,19 +303,12 @@ def build_ranking(
         avg_rb=("rb_rate_num", "mean"),
         avg_gassan=("gassan_rate_num", "mean"),
         max_total=("total_start_num", "max"),
-        tail=("tail", "first"),
-        block=("block", "first"),
-        island_id=("island_id", "first") if has_island else ("tail", "first"),
-        side=("side", "first") if has_island else ("tail", "first"),
-        pos=("pos", "first") if has_island else ("tail", "first"),
-        edge_type=("edge_type", "first") if has_island else ("tail", "first"),
-        is_end=("is_end", "first") if has_island else ("tail", "first"),
+        island_id=("island_id", "first"),
+        side=("side", "first"),
+        pos=("pos", "first"),
+        edge_type=("edge_type", "first"),
+        is_end=("is_end", "first"),
     ).reset_index()
-
-    # has_islandがFalseのときに変な値が入るので消す
-    if not has_island:
-        for c in ["island_id","side","pos","edge_type","is_end"]:
-            agg_u[c] = np.nan
 
     # ブレ対策（サンプル不足排除）
     agg_u = agg_u[agg_u["unique_days"] >= int(min_unique_days)].copy()
@@ -332,86 +322,55 @@ def build_ranking(
     wmax = float(agg_u["w_sum"].max() if agg_u["w_sum"].notna().any() else 0.0)
     trust = np.log1p(agg_u["w_sum"].fillna(0.0)) / np.log1p(wmax + 1e-9) if wmax > 0 else 0.0
 
-    # 台単体スコア：良台率（重み付き）＋信頼度（0〜1）
+    # 台単体スコア（0〜1）
     agg_u["unit_score"] = (
-        (agg_u["good_rate_weighted"].fillna(0) * 1.0) * 0.70 +
+        (agg_u["good_rate_weighted"].fillna(0.0) * 1.0) * 0.70 +
         (trust * 1.0) * 0.30
     )
 
     # -------------------------
-    # ② 末尾（tail）集計
+    # ② 島スコア（island_score）
     # -------------------------
-    agg_t = df.groupby(["shop", "machine", "tail"], dropna=False).agg(
-        t_w_sum=("w", "sum"),
-        t_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
+    agg_i = df.groupby(["shop","machine","island_id"], dropna=False).agg(
+        i_w_sum=("w", "sum"),
+        i_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
     ).reset_index()
-    agg_t["tail_score"] = (agg_t["t_good_w"] / agg_t["t_w_sum"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    agg_i["island_score"] = (agg_i["i_good_w"] / agg_i["i_w_sum"]).replace([np.inf,-np.inf], np.nan).fillna(0.0)
+
+    out = agg_u.merge(
+        agg_i[["shop","machine","island_id","island_score"]],
+        on=["shop","machine","island_id"],
+        how="left"
+    )
+    out["island_score"] = out["island_score"].fillna(0.0)
 
     # -------------------------
-    # ③ 台番帯（block）集計
+    # ③ 並びスコア（run_score）
+    #     同じ島×同じ列(side)で pos±1 の unit_score 平均
     # -------------------------
-    agg_b = df.groupby(["shop", "machine", "block"], dropna=False).agg(
-        b_w_sum=("w", "sum"),
-        b_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
-    ).reset_index()
-    agg_b["block_score"] = (agg_b["b_good_w"] / agg_b["b_w_sum"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    # 台単体にJOIN
-    out = agg_u.merge(agg_t[["shop","machine","tail","tail_score"]], on=["shop","machine","tail"], how="left")
-    out = out.merge(agg_b[["shop","machine","block","block_score"]], on=["shop","machine","block"], how="left")
-    out["tail_score"] = out["tail_score"].fillna(0.0)
-    out["block_score"] = out["block_score"].fillna(0.0)
+    tmp = out.sort_values(["island_id","side","pos"]).copy()
+    tmp["pos"] = pd.to_numeric(tmp["pos"], errors="coerce")
+    tmp["unit_score_prev"] = tmp.groupby(["island_id","side"])["unit_score"].shift(1)
+    tmp["unit_score_next"] = tmp.groupby(["island_id","side"])["unit_score"].shift(-1)
+    tmp["run_score"] = tmp[["unit_score_prev","unit_score_next"]].mean(axis=1, skipna=True).fillna(0.0)
+    out = out.merge(tmp[["unit_number","run_score"]], on="unit_number", how="left")
+    out["run_score"] = out["run_score"].fillna(0.0)
 
     # -------------------------
-    # ④ 島スコア（island_score）
+    # ④ 端ボーナス（end_bonus）
     # -------------------------
-    if has_island:
-        agg_i = df.groupby(["shop","machine","island_id"], dropna=False).agg(
-            i_w_sum=("w", "sum"),
-            i_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
-        ).reset_index()
-        agg_i["island_score"] = (agg_i["i_good_w"] / agg_i["i_w_sum"]).replace([np.inf,-np.inf], np.nan).fillna(0.0)
-
-        out = out.merge(agg_i[["shop","machine","island_id","island_score"]],
-                        on=["shop","machine","island_id"], how="left")
-        out["island_score"] = out["island_score"].fillna(0.0)
-    else:
-        out["island_score"] = 0.0
+    out["end_bonus"] = (pd.to_numeric(out["is_end"], errors="coerce").fillna(0).astype(int) > 0).astype(float)
 
     # -------------------------
-    # ⑤ 並びスコア（run_score）：同じ島×同じ列(side)で pos±1 の unit_score 平均
+    # ⑤ 最終スコア（正規化して事故防止）
     # -------------------------
-    if has_island and out["pos"].notna().any() and out["side"].notna().any():
-        tmp = out.sort_values(["island_id","side","pos"]).copy()
-        tmp["pos"] = pd.to_numeric(tmp["pos"], errors="coerce")
-        tmp["unit_score_prev"] = tmp.groupby(["island_id","side"])["unit_score"].shift(1)
-        tmp["unit_score_next"] = tmp.groupby(["island_id","side"])["unit_score"].shift(-1)
-        tmp["run_score"] = tmp[["unit_score_prev","unit_score_next"]].mean(axis=1, skipna=True).fillna(0.0)
-        out = out.merge(tmp[["unit_number","run_score"]], on="unit_number", how="left")
-        out["run_score"] = out["run_score"].fillna(0.0)
-    else:
-        out["run_score"] = 0.0
-
-    # -------------------------
-    # ⑥ 端ボーナス（end_bonus）
-    # -------------------------
-    if has_island and "is_end" in out.columns:
-        out["end_bonus"] = (pd.to_numeric(out["is_end"], errors="coerce").fillna(0).astype(int) > 0).astype(float)
-    else:
-        out["end_bonus"] = 0.0
-
-    # -------------------------
-    # ⑦ 最終スコア（正規化して事故防止）
-    # -------------------------
-    ws = float(w_unit + w_tail + w_block + w_island + w_run + w_end)
+    ws = float(w_unit + w_island + w_run + w_end)
     if ws <= 0:
         ws = 1.0
-    wu, wt, wb, wi, wr, we = (w_unit/ws, w_tail/ws, w_block/ws, w_island/ws, w_run/ws, w_end/ws)
+    wu, wi, wr, we = (w_unit/ws, w_island/ws, w_run/ws, w_end/ws)
 
     out["final_score"] = (
         out["unit_score"].fillna(0.0) * wu +
-        out["tail_score"].fillna(0.0) * wt +
-        out["block_score"].fillna(0.0) * wb +
         out["island_score"].fillna(0.0) * wi +
         out["run_score"].fillna(0.0) * wr +
         out["end_bonus"].fillna(0.0) * we
@@ -421,7 +380,7 @@ def build_ranking(
     out["good_rate_weighted"] = (out["good_rate_weighted"] * 100).round(1)
     out["good_rate_simple"] = (out["good_rate_simple"] * 100).round(1)
 
-    for c in ["unit_score","tail_score","block_score","island_score","run_score","end_bonus","final_score"]:
+    for c in ["unit_score","island_score","run_score","end_bonus","final_score"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(3)
 
     out["avg_rb"] = pd.to_numeric(out["avg_rb"], errors="coerce").round(1)
@@ -435,8 +394,7 @@ def build_ranking(
     out["rank"] = np.arange(1, len(out) + 1)
     out["train_start"] = start_day
     out["train_end"] = end_day
-    out["block_size"] = int(bs)
-    out["weights"] = f"unit={wu:.2f},tail={wt:.2f},block={wb:.2f},island={wi:.2f},run={wr:.2f},end={we:.2f}"
+    out["weights"] = f"unit={wu:.2f},island={wi:.2f},run={wr:.2f},end={we:.2f}"
 
     return out
 
@@ -494,23 +452,15 @@ with st.sidebar:
             st.caption("この機種はプリセット未登録です。手動でスライダーを調整してください。")
 
     st.divider()
-    st.header("朝イチ候補スコア（勝率寄り）")
+    st.header("朝イチ候補スコア（島マスタ前提）")
 
-    # 場所（実配置）
-    st.subheader("島・並び・端（島マスタがある場合に有効）")
-    w_island = st.slider("島（island）の重み", 0.0, 1.0, 0.35, 0.05)
-    w_run    = st.slider("並び（run）の重み",   0.0, 1.0, 0.25, 0.05)
-    w_end    = st.slider("端（end）の重み",     0.0, 1.0, 0.05, 0.05)
+    w_island = st.slider("島（island）の重み", 0.0, 1.0, 0.45, 0.05)
+    w_run    = st.slider("並び（run）の重み",   0.0, 1.0, 0.35, 0.05)
+    w_end    = st.slider("端（end）の重み",     0.0, 1.0, 0.10, 0.05)
 
-    # 従来の近似（台番号特徴）
-    st.subheader("台番号のクセ（島マスタ無しでも有効）")
-    block_size = st.number_input("台番帯の幅（block_size）", 5, 50, 10, 1)
-    w_tail  = st.slider("末尾（tail）の重み", 0.0, 1.0, 0.20, 0.05)
-    w_block = st.slider("台番帯（block）の重み", 0.0, 1.0, 0.15, 0.05)
-
-    # 台単体は残り（合計>1でも build_ranking 内で正規化するので事故りません）
-    w_unit = max(0.0, 1.0 - (w_island + w_run + w_end + w_tail + w_block))
+    w_unit = max(0.0, 1.0 - (w_island + w_run + w_end))
     st.caption(f"台単体の重み（自動の目安）: {w_unit:.2f}  ※ 合計が1を超えても内部で正規化します")
+
 
     st.divider()
     st.header("良台日判定（スライダー）")
@@ -631,7 +581,6 @@ with tab1:
 - **end_bonus**：端ボーナス（端なら1.0）
 
 - **tail / tail_score**：末尾（unit_number%10）とその強さ
-- **block / block_score**：台番帯（unit_number//block_size）とその強さ（近似的な島/並びのクセ）
 
 - **good_rate_weighted(%)**：直近重視の良台率（新しい日ほど重く評価）
 - **good_rate_simple(%)**：単純な良台率（期間を均等に扱う）
@@ -658,10 +607,7 @@ with tab1:
             max_rb=float(max_rb),
             max_gassan=float(max_gassan),
             min_unique_days=int(min_unique_days),
-            block_size=int(block_size),
             w_unit=float(w_unit),
-            w_tail=float(w_tail),
-            w_block=float(w_block),
             w_island=float(w_island),
             w_run=float(w_run),
             w_end=float(w_end),
@@ -680,12 +626,13 @@ with tab1:
                 "island_id","side","pos","edge_type","is_end",
                 "final_score",
                 "island_score","run_score","unit_score","end_bonus",
-                "tail","block","tail_score","block_score",
                 "good_rate_weighted","good_rate_simple",
                 "unique_days","samples","w_sum",
                 "avg_rb","avg_gassan","max_total",
+                "weights"
             ]
             show_cols = [c for c in show_cols if c in ranking.columns]
+
             st.dataframe(ranking.head(int(top_n))[show_cols], use_container_width=True, hide_index=True)
 
             filename = make_filename(machine, "morning_candidates", date_str)
