@@ -363,17 +363,6 @@ with st.sidebar:
     min_unique_days = st.number_input("最小サンプル日数（稼働日数）", 1, 60, 3, 1)
     top_n = st.number_input("上位N件表示", 1, 200, 30, 1)
 
-# ========= Main UI =========
-st.divider()
-st.subheader("共通：過去データアップロード（朝イチ候補 / 精度検証で使用）")
-df_all_shared = upload_past_data_ui() 
-
-tab1, tab2, tab3 = st.tabs([
-    "朝イチ候補（過去データ集計）",
-    "実戦ログ（CSVに追記して更新版DL）",
-    "精度検証（バックテスト）"
-])
-
 # --------- 共通：過去データの投入（tab1/tab3で使う） ---------
 def upload_past_data_ui():
     st.caption("複数CSV（original.csv）または zip（CSVをまとめたもの）をアップロードしてください。")
@@ -408,6 +397,18 @@ def upload_past_data_ui():
         return pd.DataFrame(columns=HEADER)
 
     return df_all
+
+
+# ========= Main UI =========
+st.divider()
+st.subheader("共通：過去データアップロード（朝イチ候補 / 精度検証で使用）")
+df_all_shared = upload_past_data_ui()
+
+tab1, tab2, tab3 = st.tabs([
+    "朝イチ候補（過去データ集計）",
+    "実戦ログ（CSVに追記して更新版DL）",
+    "精度検証（バックテスト）"
+])
 
 with tab1:
     st.subheader("① 朝イチ候補（過去の original.csv を集計してランキング）")
