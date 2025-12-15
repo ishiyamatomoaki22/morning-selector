@@ -27,16 +27,16 @@ st.caption("過去の original.csv（複数日）をアップロード → 店×
 
 JST = ZoneInfo("Asia/Tokyo")
 
-# ========= 朝イチ用おすすめ設定（候補を狭めすぎない） =========
+# ========= 朝イチ用おすすめ設定（# 機種ごとのおすすめ設定（朝イチ向け・勝率重視の目安)） =========
 RECOMMENDED = {
-    "マイジャグラーV":           {"min_games": 2500, "max_rb": 290.0, "max_gassan": 195.0},
-    "ゴーゴージャグラー3":       {"min_games": 2500, "max_rb": 300.0, "max_gassan": 200.0},
-    "ハッピージャグラーVIII":    {"min_games": 3000, "max_rb": 285.0, "max_gassan": 190.0},
-    "ファンキージャグラー2KT":   {"min_games": 2500, "max_rb": 320.0, "max_gassan": 210.0},
-    "ミスタージャグラー":        {"min_games": 2300, "max_rb": 320.0, "max_gassan": 210.0},
-    "ジャグラーガールズSS":      {"min_games": 2300, "max_rb": 285.0, "max_gassan": 190.0},
-    "ネオアイムジャグラーEX":    {"min_games": 2300, "max_rb": 350.0, "max_gassan": 220.0},
-    "ウルトラミラクルジャグラー":{"min_games": 3000, "max_rb": 320.0, "max_gassan": 210.0},
+    "マイジャグラーV":            {"min_games": 2500, "max_rb": 280.0, "max_gassan": 175.0},
+    "ゴーゴージャグラー3":        {"min_games": 2500, "max_rb": 290.0, "max_gassan": 180.0},
+    "ハッピージャグラーVIII":     {"min_games": 2800, "max_rb": 270.0, "max_gassan": 170.0},
+    "ファンキージャグラー2KT":    {"min_games": 2500, "max_rb": 300.0, "max_gassan": 185.0},
+    "ミスタージャグラー":         {"min_games": 2500, "max_rb": 300.0, "max_gassan": 185.0},
+    "ジャグラーガールズSS":       {"min_games": 2300, "max_rb": 280.0, "max_gassan": 175.0},
+    "ネオアイムジャグラーEX":      {"min_games": 2500, "max_rb": 320.0, "max_gassan": 190.0},
+    "ウルトラミラクルジャグラー": {"min_games": 2800, "max_rb": 300.0, "max_gassan": 185.0},
 }
 
 # ========= Helpers =========
@@ -141,6 +141,8 @@ def make_filename(machine: str, suffix: str, date_str: str) -> str:
 PLAYLOG_HEADER = [
     "created_at",
     "date","shop","machine","unit_number",
+    "tool_rank",
+    "select_reason",
     "start_time","end_time",
     "invest_medals","payout_medals","profit_medals",
     "play_games",
@@ -484,6 +486,29 @@ tab1, tab2 = st.tabs([
 ])
 
 with tab1:
+    with st.expander("候補テーブルの見方（用語説明）", expanded=False):
+        st.markdown("""
+    - **rank**：最終順位（final_scoreの高い順）
+    - **unit_number**：台番号
+    - **machine**：機種名（全機種表示にする場合に重要）
+    - **tail**：末尾（unit_number % 10）
+    - **block**：台番帯（unit_number // block_size）※近い台＝同じ島付近の近似
+
+    - **final_score**：最終スコア（朝イチ優先度の結論）
+    - `final_score = w_unit*unit_score + w_tail*tail_score + w_block*block_score`
+
+    - **unit_score**：その台“単体”の強さ（良台率＋信頼度）
+    - **tail_score**：その末尾が強いか（店のクセ）
+    - **block_score**：その帯が強いか（並び・島のクセ）
+
+    - **good_rate_weighted(%)**：直近重視の良台率（新しい日ほど重く評価）
+    - **good_rate_simple(%)**：単純な良台率（期間を均等に扱う）
+    - **unique_days**：データに登場した日数（少ないとブレる）
+    - **w_sum**：減衰込みの学習量（大きいほど信頼）
+    - **avg_rb / avg_gassan**：平均RB/合算（参考）
+    - **max_total**：最大総回転（参考）
+    """)
+
     st.subheader("① 朝イチ候補（過去の original.csv を集計してランキング）")
 
     if df_all_shared.empty:
@@ -554,6 +579,12 @@ with tab2:
         with col2:
             log_machine = st.text_input("machine", value=machine)
             unit_number = st.number_input("unit_number（台番号）", min_value=0, step=1, value=0)
+            tool_rank = st.number_input("tool_rank（ツール候補順位）", min_value=0, step=1, value=0)
+
+            select_reason = st.selectbox(
+                "select_reason（着席理由）",
+                ["", "ツール上位", "末尾が強い", "角/角2", "並び/帯が強い", "前日挙動", "直感", "空き台都合", "その他"]
+            )
         with col3:
             play_games = st.number_input("play_games（自分が回したG数）", min_value=0, step=10, value=0)
 
@@ -591,6 +622,8 @@ with tab2:
             "shop": log_shop,
             "machine": log_machine,
             "unit_number": int(unit_number),
+            "tool_rank": int(tool_rank),
+            "select_reason": select_reason,
             "start_time": start_time,
             "end_time": end_time,
             "invest_medals": int(invest),
