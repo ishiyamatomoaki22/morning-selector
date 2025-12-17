@@ -996,7 +996,7 @@ with tab3:
     st.subheader("③ バックテスト（ツール精度検証：上位Nの良台率 / lift / Hit@N）")
     st.caption("※ その日を予測する際、学習には前日までのデータのみ使用（リーク防止）。良台判定は機種別RECOMMENDED（無い機種はサイドバー値）を使用。")
 
-    # ★ここが追加：指標の説明UI
+    # 指標の説明（ヘルプ）
     with st.expander("指標の説明（クリックで開く）", expanded=False):
         st.markdown("""
 ### このバックテストがやっていること
@@ -1012,19 +1012,15 @@ with tab3:
 - **selected_n**：その評価ケースで実際にTopNとして扱えた台数（通常N。候補不足でN未満になることがあります）
 - **good_in_topN**：TopNの中に「良台（当たり）」が何台あったか
 - **precision_topN**：TopNの良台率  
-  `good_in_topN / selected_n`  
-  → 「上位Nに座ったとき、当たりに触れる割合」
+  `good_in_topN / selected_n`
 - **all_units_n**：その日その機種の全台数
 - **good_all**：その日その機種の良台（当たり）総数
 - **baseline_good_rate**：その日その機種の全体良台率（店の地合い）  
-  `good_all / all_units_n`  
-  → 「その日はそもそも当たりが多い日だったか」
+  `good_all / all_units_n`
 - **lift_pt**：TopNが平均よりどれだけ有利か（ポイント差）  
-  `precision_topN - baseline_good_rate`  
-  → プラスなら「ツール上位が平均より当たりやすい」
+  `precision_topN - baseline_good_rate`
 - **hit_at_N**：TopNの中に当たりが1台でもあれば1、なければ0
-- **hit_rate**：hit_at_Nの平均  
-  → 「TopNを見れば、当たりが混ざっている日がどれくらいあるか」
+- **hit_rate**：hit_at_Nの平均
 
 ### 実戦的に何を見るべき？
 - **lift_pt**：ツールを使う価値（平均より当たりを寄せているか）
@@ -1055,6 +1051,7 @@ with tab3:
         eval_end = st.date_input("評価終了日", value=max_day, min_value=min_day, max_value=max_day, key="bt_eval_end")
     with colC:
         topN_text = st.text_input("TopN（カンマ区切り）", value="5,10,20,30", key="bt_topn")
+
     try:
         top_ns = [int(x.strip()) for x in topN_text.split(",") if x.strip()]
         top_ns = sorted(list(set([n for n in top_ns if n > 0])))
@@ -1066,7 +1063,12 @@ with tab3:
     if target_mode == "全機種":
         machines_bt = machines_available
     else:
-        machines_bt = st.multiselect("対象機種を選択", options=machines_available, default=[machine] if machine in machines_available else machines_available[:1], key="bt_machines")
+        machines_bt = st.multiselect(
+            "対象機種を選択",
+            options=machines_available,
+            default=[machine] if machine in machines_available else machines_available[:1],
+            key="bt_machines"
+        )
         if not machines_bt:
             st.warning("対象機種が未選択です。")
             st.stop()
@@ -1098,17 +1100,18 @@ with tab3:
             st.error("バックテスト結果が生成できませんでした（評価期間が短い / サンプル不足 / データ欠損の可能性）。")
             st.stop()
 
+        # ========== サマリ（全体） ==========
         overall_show = overall_df.copy()
-        for c in ["precision_topN","baseline_good_rate","lift_pt","hit_rate"]:
+        for c in ["precision_topN", "baseline_good_rate", "lift_pt", "hit_rate"]:
             overall_show[c] = pd.to_numeric(overall_show[c], errors="coerce")
         overall_show["precision_topN(%)"] = (overall_show["precision_topN"] * 100).round(1)
         overall_show["baseline_good_rate(%)"] = (overall_show["baseline_good_rate"] * 100).round(1)
-        overall_show["lift_pt(%)"] = (overall_show["lift_pt"] * 100).round(1)
+        overall_show["lift_pt(%pt)"] = (overall_show["lift_pt"] * 100).round(1)
         overall_show["hit_rate(%)"] = (overall_show["hit_rate"] * 100).round(1)
 
         st.subheader("結果サマリ（全体）")
         st.dataframe(
-            overall_show[["topN","eval_cases","precision_topN(%)","baseline_good_rate(%)","lift_pt(%)","hit_rate(%)"]],
+            overall_show[["topN", "eval_cases", "precision_topN(%)", "baseline_good_rate(%)", "lift_pt(%pt)", "hit_rate(%)"]],
             use_container_width=True,
             hide_index=True
         )
@@ -1116,34 +1119,183 @@ with tab3:
         best = overall_show.sort_values("lift_pt", ascending=False).head(1)
         if not best.empty:
             bN = int(best["topN"].iloc[0])
-            st.success(f"liftが最大のTopN：**Top{bN}**（lift={best['lift_pt(%)'].iloc[0]}%pt / Hit={best['hit_rate(%)'].iloc[0]}%）")
+            st.success(
+                f"liftが最大のTopN：**Top{bN}**（lift={best['lift_pt(%pt)'].iloc[0]}%pt / Hit={best['hit_rate(%)'].iloc[0]}%）"
+            )
 
+        # ========== サマリ（機種別） ==========
         st.subheader("結果サマリ（機種別）")
         pm = per_machine_df.copy()
-        for c in ["precision_topN","baseline_good_rate","lift_pt","hit_rate"]:
+        for c in ["precision_topN", "baseline_good_rate", "lift_pt", "hit_rate"]:
             pm[c] = pd.to_numeric(pm[c], errors="coerce")
         pm["precision_topN(%)"] = (pm["precision_topN"] * 100).round(1)
         pm["baseline_good_rate(%)"] = (pm["baseline_good_rate"] * 100).round(1)
-        pm["lift_pt(%)"] = (pm["lift_pt"] * 100).round(1)
+        pm["lift_pt(%pt)"] = (pm["lift_pt"] * 100).round(1)
         pm["hit_rate(%)"] = (pm["hit_rate"] * 100).round(1)
 
         st.dataframe(
-            pm[["machine","topN","eval_cases","precision_topN(%)","baseline_good_rate(%)","lift_pt(%)","hit_rate(%)"]],
+            pm[["machine", "topN", "eval_cases", "precision_topN(%)", "baseline_good_rate(%)", "lift_pt(%pt)", "hit_rate(%)"]],
             use_container_width=True,
             hide_index=True
         )
 
+        # ========== 詳細（day × machine × topN） ==========
         st.subheader("詳細（day × machine × topN）")
         det = detail.copy()
+        det["date"] = pd.to_datetime(det["date"], errors="coerce").dt.date
         det["precision_topN(%)"] = (pd.to_numeric(det["precision_topN"], errors="coerce") * 100).round(1)
         det["baseline_good_rate(%)"] = (pd.to_numeric(det["baseline_good_rate"], errors="coerce") * 100).round(1)
-        det["lift_pt(%)"] = (pd.to_numeric(det["lift_pt"], errors="coerce") * 100).round(1)
+        det["lift_pt(%pt)"] = (pd.to_numeric(det["lift_pt"], errors="coerce") * 100).round(1)
+
         st.dataframe(
-            det[["date","machine","topN","selected_n","good_in_topN","precision_topN(%)","baseline_good_rate(%)","lift_pt(%)","hit_at_N"]],
+            det[["date", "machine", "topN", "selected_n", "good_in_topN", "precision_topN(%)", "baseline_good_rate(%)", "lift_pt(%pt)", "hit_at_N"]],
             use_container_width=True,
             hide_index=True
         )
 
+        # ============================================================
+        # ★追加：外れ日ランキング（liftが低い日 TOP20）
+        # ============================================================
+        st.divider()
+        st.subheader("外れ日分析（特定の日に外れやすいかを見る）")
+
+        # どのTopNで外れ日を見るか（選択）
+        N_focus = st.selectbox(
+            "外れ日ランキングの対象TopN",
+            options=sorted(det["topN"].dropna().unique().astype(int).tolist()),
+            index=0,
+            key="bt_focus_topN"
+        )
+
+        # 日別に集計（machineを跨いで合算する：実戦的な「その日の総合外れ度」）
+        detN = det[det["topN"] == int(N_focus)].copy()
+
+        def _daily_agg(g: pd.DataFrame) -> pd.Series:
+            total_sel = int(pd.to_numeric(g["selected_n"], errors="coerce").fillna(0).sum())
+            total_good_sel = int(pd.to_numeric(g["good_in_topN"], errors="coerce").fillna(0).sum())
+            precision = (total_good_sel / total_sel) if total_sel > 0 else np.nan
+
+            total_all = int(pd.to_numeric(g["all_units_n"], errors="coerce").fillna(0).sum())
+            total_good_all = int(pd.to_numeric(g["good_all"], errors="coerce").fillna(0).sum())
+            baseline = (total_good_all / total_all) if total_all > 0 else np.nan
+
+            hit_rate = float(pd.to_numeric(g["hit_at_N"], errors="coerce").mean()) if len(g) > 0 else np.nan
+            return pd.Series({
+                "eval_cases(machine数)": int(len(g)),
+                "selected_n_total": total_sel,
+                "good_in_topN_total": total_good_sel,
+                "precision_topN": precision,
+                "baseline_good_rate": baseline,
+                "lift_pt": (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan,
+                "hit_rate": hit_rate,
+            })
+
+        day_sum = detN.groupby("date", dropna=False).apply(_daily_agg).reset_index()
+
+        # 表示用（%）
+        day_show = day_sum.copy()
+        day_show["precision_topN(%)"] = (pd.to_numeric(day_show["precision_topN"], errors="coerce") * 100).round(1)
+        day_show["baseline_good_rate(%)"] = (pd.to_numeric(day_show["baseline_good_rate"], errors="coerce") * 100).round(1)
+        day_show["lift_pt(%pt)"] = (pd.to_numeric(day_show["lift_pt"], errors="coerce") * 100).round(1)
+        day_show["hit_rate(%)"] = (pd.to_numeric(day_show["hit_rate"], errors="coerce") * 100).round(1)
+
+        colX, colY = st.columns([1, 1])
+        with colX:
+            k = st.number_input("外れ日ランキング表示件数（liftが低い順）", min_value=5, max_value=100, value=20, step=5, key="bt_bad_days_k")
+        with colY:
+            only_really_bad = st.checkbox("liftがマイナスの日だけに絞る", value=True, key="bt_only_bad")
+
+        bad_days = day_show.sort_values("lift_pt", ascending=True).copy()
+        if only_really_bad:
+            bad_days = bad_days[pd.to_numeric(bad_days["lift_pt"], errors="coerce") < 0].copy()
+
+        st.markdown(f"#### 外れ日ランキング（Top{int(N_focus)} / liftが低い順）")
+        if bad_days.empty:
+            st.info("条件に一致する外れ日がありません（lift<0 が無い、またはデータ不足）。")
+        else:
+            st.dataframe(
+                bad_days.head(int(k))[[
+                    "date",
+                    "eval_cases(machine数)",
+                    "selected_n_total",
+                    "good_in_topN_total",
+                    "precision_topN(%)",
+                    "baseline_good_rate(%)",
+                    "lift_pt(%pt)",
+                    "hit_rate(%)",
+                ]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.download_button(
+                "外れ日ランキング（CSV）をダウンロード",
+                data=bad_days.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{date_str}_bad_days_top{int(N_focus)}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="bt_dl_bad_days"
+            )
+
+        # ============================================================
+        # ★追加：日別ヒートマップ（date × topN で lift を色付け）
+        # ============================================================
+        st.divider()
+        st.subheader("日別ヒートマップ（date × topN の lift）")
+        st.caption("lift(%pt)=（ツール上位の良台率）−（全体良台率）。緑ほど良く、赤ほど悪い日です。")
+
+        # day × topN に集計（machine跨いで合算）
+        det2 = det.copy()
+        det2["selected_n"] = pd.to_numeric(det2["selected_n"], errors="coerce").fillna(0).astype(int)
+        det2["good_in_topN"] = pd.to_numeric(det2["good_in_topN"], errors="coerce").fillna(0).astype(int)
+        det2["all_units_n"] = pd.to_numeric(det2["all_units_n"], errors="coerce").fillna(0).astype(int)
+        det2["good_all"] = pd.to_numeric(det2["good_all"], errors="coerce").fillna(0).astype(int)
+
+        def _day_topN_agg(g: pd.DataFrame) -> pd.Series:
+            sel = int(g["selected_n"].sum())
+            good_sel = int(g["good_in_topN"].sum())
+            precision = (good_sel / sel) if sel > 0 else np.nan
+
+            alln = int(g["all_units_n"].sum())
+            good_all = int(g["good_all"].sum())
+            baseline = (good_all / alln) if alln > 0 else np.nan
+
+            lift = (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan
+            return pd.Series({"lift_pt": lift})
+
+        day_topN = det2.groupby(["date", "topN"], dropna=False).apply(_day_topN_agg).reset_index()
+        day_topN["lift_pt(%pt)"] = (pd.to_numeric(day_topN["lift_pt"], errors="coerce") * 100).round(1)
+
+        pivot = day_topN.pivot_table(index="date", columns="topN", values="lift_pt(%pt)", aggfunc="mean")
+
+        # 表示範囲の調整（見やすさ）
+        show_last = st.number_input("直近何日を表示する？（0なら全日）", min_value=0, max_value=9999, value=60, step=10, key="bt_heatmap_last_days")
+        pivot2 = pivot.copy()
+        if int(show_last) > 0 and len(pivot2) > int(show_last):
+            pivot2 = pivot2.tail(int(show_last))
+
+        st.markdown("#### ヒートマップ（テーブル色付け）")
+        try:
+            st.dataframe(
+                pivot2.style
+                    .format("{:.1f}")
+                    .background_gradient(axis=None, cmap="RdYlGn"),
+                use_container_width=True
+            )
+        except Exception:
+            # Stylerが効かない環境向けのフォールバック
+            st.dataframe(pivot2, use_container_width=True)
+
+        st.download_button(
+            "日別ヒートマップ（pivot CSV）をダウンロード",
+            data=pivot.to_csv().encode("utf-8-sig"),
+            file_name=f"{date_str}_lift_heatmap_pivot.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="bt_dl_heatmap"
+        )
+
+        # ========== 既存：バックテスト結果のダウンロード ==========
         st.divider()
         st.subheader("バックテスト結果のダウンロード")
         dl_zip = st.checkbox("詳細・サマリをzipでまとめてDL", value=True, key="bt_dl_zip")
@@ -1153,6 +1305,8 @@ with tab3:
                 z.writestr(f"{date_str}_bt_overall.csv", overall_df.to_csv(index=False).encode("utf-8-sig"))
                 z.writestr(f"{date_str}_bt_per_machine.csv", per_machine_df.to_csv(index=False).encode("utf-8-sig"))
                 z.writestr(f"{date_str}_bt_detail.csv", detail.to_csv(index=False).encode("utf-8-sig"))
+                z.writestr(f"{date_str}_bt_bad_days_top{int(N_focus)}.csv", bad_days.to_csv(index=False).encode("utf-8-sig") if 'bad_days' in locals() else b"")
+                z.writestr(f"{date_str}_bt_lift_heatmap_pivot.csv", pivot.to_csv().encode("utf-8-sig") if 'pivot' in locals() else b"")
             st.download_button(
                 "バックテスト結果（zip）をダウンロード",
                 data=mem.getvalue(),
