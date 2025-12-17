@@ -310,14 +310,12 @@ def make_log_filename(date_str: str) -> str:
 # ========= Backtest helpers =========
 def make_threshold_df(min_games_fallback: int, max_rb_fallback: float, max_gassan_fallback: float) -> pd.DataFrame:
     rows = []
-    # known machines
     for m in MACHINE_PRESETS:
         rec = RECOMMENDED.get(m)
         if rec:
             rows.append({"machine": m, "min_games": int(rec["min_games"]), "max_rb": float(rec["max_rb"]), "max_gassan": float(rec["max_gassan"])})
         else:
             rows.append({"machine": m, "min_games": int(min_games_fallback), "max_rb": float(max_rb_fallback), "max_gassan": float(max_gassan_fallback)})
-    # safety: for any machine not in presets, fallback
     rows.append({"machine": "__DEFAULT__", "min_games": int(min_games_fallback), "max_rb": float(max_rb_fallback), "max_gassan": float(max_gassan_fallback)})
     return pd.DataFrame(rows)
 
@@ -328,7 +326,6 @@ def add_is_good_day(df: pd.DataFrame, thr_df: pd.DataFrame) -> pd.DataFrame:
     out["gassan_rate_num"] = pd.to_numeric(out["gassan_rate"], errors="coerce")
 
     out = out.merge(thr_df, on="machine", how="left")
-    # fallback for unknown machines
     fallback = thr_df[thr_df["machine"] == "__DEFAULT__"].iloc[0]
     for c in ["min_games","max_rb","max_gassan"]:
         out[c] = out[c].fillna(fallback[c])
@@ -341,6 +338,153 @@ def add_is_good_day(df: pd.DataFrame, thr_df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+def build_ranking(
+    df_all: pd.DataFrame,
+    shop: str,
+    machine: str,
+    base_day: date,
+    lookback_days: int,
+    tau: int,
+    min_games: int,
+    max_rb: float,
+    max_gassan: float,
+    min_unique_days: int,
+    w_unit: float,
+    w_island: float,
+    w_run: float,
+    w_end: float,
+):
+    if df_all.empty:
+        return pd.DataFrame()
+
+    df = df_all.copy()
+    df = df[df["date"].notna()].copy()
+
+    start_day = (pd.to_datetime(base_day) - pd.Timedelta(days=int(lookback_days))).date()
+    end_day = (pd.to_datetime(base_day) - pd.Timedelta(days=1)).date()
+
+    df = df[(df["date"] >= start_day) & (df["date"] <= end_day)].copy()
+    df = df[(df["shop"] == shop) & (df["machine"] == machine)].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    for c in ["island_id","side","pos","edge_type","is_end"]:
+        if c not in df.columns:
+            df[c] = np.nan
+    if "is_end" in df.columns:
+        df["is_end"] = pd.to_numeric(df["is_end"], errors="coerce").fillna(0).astype(int)
+
+    df["unit_number"] = pd.to_numeric(df["unit_number"], errors="coerce")
+    df = df[df["unit_number"].notna()].copy()
+    df["unit_number"] = df["unit_number"].astype(int)
+
+    df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
+    df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
+    df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
+
+    df["days_ago"] = (pd.to_datetime(base_day) - pd.to_datetime(df["date"])).dt.days
+    df["w"] = np.exp(-df["days_ago"] / max(int(tau), 1))
+
+    df["is_good_day"] = (
+        (df["total_start_num"] >= min_games) &
+        (df["rb_rate_num"] <= max_rb) &
+        (df["gassan_rate_num"] <= max_gassan)
+    ).astype(int)
+
+    gcols = ["shop", "machine", "unit_number"]
+    agg_u = df.groupby(gcols, dropna=False).agg(
+        samples=("date", "count"),
+        unique_days=("date", "nunique"),
+        w_sum=("w", "sum"),
+        good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
+        good_days=("is_good_day", "sum"),
+        avg_rb=("rb_rate_num", "mean"),
+        avg_gassan=("gassan_rate_num", "mean"),
+        max_total=("total_start_num", "max"),
+        island_id=("island_id", "first"),
+        side=("side", "first"),
+        pos=("pos", "first"),
+        edge_type=("edge_type", "first"),
+        is_end=("is_end", "first"),
+    ).reset_index()
+
+    agg_u = agg_u[agg_u["unique_days"] >= int(min_unique_days)].copy()
+    if agg_u.empty:
+        return pd.DataFrame()
+
+    agg_u["good_rate_weighted"] = (agg_u["good_w"] / agg_u["w_sum"]).replace([np.inf, -np.inf], np.nan)
+    agg_u["good_rate_simple"] = (agg_u["good_days"] / agg_u["unique_days"]).replace([np.inf, -np.inf], np.nan)
+
+    wmax = float(agg_u["w_sum"].max() if agg_u["w_sum"].notna().any() else 0.0)
+    trust = np.log1p(agg_u["w_sum"].fillna(0.0)) / np.log1p(wmax + 1e-9) if wmax > 0 else 0.0
+
+    agg_u["unit_score"] = (
+        (agg_u["good_rate_weighted"].fillna(0.0) * 1.0) * 0.70 +
+        (trust * 1.0) * 0.30
+    )
+
+    out = agg_u.copy()
+
+    if out["island_id"].isna().all():
+        out["island_score"] = 0.0
+    else:
+        agg_i = df.groupby(["shop","machine","island_id"], dropna=False).agg(
+            i_w_sum=("w", "sum"),
+            i_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
+        ).reset_index()
+        agg_i["island_score"] = (agg_i["i_good_w"] / agg_i["i_w_sum"]).replace([np.inf,-np.inf], np.nan).fillna(0.0)
+        out = out.merge(
+            agg_i[["shop","machine","island_id","island_score"]],
+            on=["shop","machine","island_id"],
+            how="left"
+        )
+        out["island_score"] = out["island_score"].fillna(0.0)
+
+    if out["pos"].isna().all() or out["side"].isna().all():
+        out["run_score"] = 0.0
+    else:
+        tmp = out.sort_values(["island_id","side","pos"]).copy()
+        tmp["pos"] = pd.to_numeric(tmp["pos"], errors="coerce")
+        tmp["unit_score_prev"] = tmp.groupby(["island_id","side"])["unit_score"].shift(1)
+        tmp["unit_score_next"] = tmp.groupby(["island_id","side"])["unit_score"].shift(-1)
+        tmp["run_score"] = tmp[["unit_score_prev","unit_score_next"]].mean(axis=1, skipna=True).fillna(0.0)
+        out = out.merge(tmp[["unit_number","run_score"]], on="unit_number", how="left")
+        out["run_score"] = out["run_score"].fillna(0.0)
+
+    out["end_bonus"] = (pd.to_numeric(out["is_end"], errors="coerce").fillna(0).astype(int) > 0).astype(float)
+
+    ws = float(w_unit + w_island + w_run + w_end)
+    if ws <= 0:
+        ws = 1.0
+    wu, wi, wr, we = (w_unit/ws, w_island/ws, w_run/ws, w_end/ws)
+
+    out["final_score"] = (
+        out["unit_score"].fillna(0.0) * wu +
+        out["island_score"].fillna(0.0) * wi +
+        out["run_score"].fillna(0.0) * wr +
+        out["end_bonus"].fillna(0.0) * we
+    )
+
+    out["good_rate_weighted"] = (out["good_rate_weighted"] * 100).round(1)
+    out["good_rate_simple"] = (out["good_rate_simple"] * 100).round(1)
+
+    for c in ["unit_score","island_score","run_score","end_bonus","final_score"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").round(3)
+
+    out["avg_rb"] = pd.to_numeric(out["avg_rb"], errors="coerce").round(1)
+    out["avg_gassan"] = pd.to_numeric(out["avg_gassan"], errors="coerce").round(1)
+
+    out = out.sort_values(
+        ["final_score","island_score","run_score","unit_score","w_sum"],
+        ascending=[False, False, False, False, False]
+    ).reset_index(drop=True)
+
+    out["rank"] = np.arange(1, len(out) + 1)
+    out["train_start"] = start_day
+    out["train_end"] = end_day
+    out["weights"] = f"unit={wu:.2f},island={wi:.2f},run={wr:.2f},end={we:.2f}"
+    return out
+
 def backtest_precision_hit(
     df_all: pd.DataFrame,
     shop: str,
@@ -348,16 +492,13 @@ def backtest_precision_hit(
     lookback_days: int,
     tau: int,
     min_unique_days: int,
-    # ranking weights
     w_unit: float,
     w_island: float,
     w_run: float,
     w_end: float,
-    # good-day thresholds fallback
     min_games_fallback: int,
     max_rb_fallback: float,
     max_gassan_fallback: float,
-    # eval params
     top_ns: list[int],
     eval_start: date | None,
     eval_end: date | None,
@@ -373,7 +514,6 @@ def backtest_precision_hit(
     if df.empty:
         return None, None, None
 
-    # evaluation date range
     all_days = sorted(df["date"].unique().tolist())
     if not all_days:
         return None, None, None
@@ -387,15 +527,17 @@ def backtest_precision_hit(
     if not eval_days:
         return None, None, None
 
-    # thresholds
     thr_df = make_threshold_df(min_games_fallback, max_rb_fallback, max_gassan_fallback)
     df_labeled = add_is_good_day(df, thr_df)
 
     rows = []
-    # iterate each day and machine
     for day in eval_days:
         for m in machines:
-            # build ranking using ONLY past data (leak防止)
+            rec = RECOMMENDED.get(m)
+            mg = int(rec["min_games"]) if rec else int(min_games_fallback)
+            mrb = float(rec["max_rb"]) if rec else float(max_rb_fallback)
+            mgs = float(rec["max_gassan"]) if rec else float(max_gassan_fallback)
+
             ranking = build_ranking(
                 df_all=df_all,
                 shop=shop,
@@ -403,9 +545,9 @@ def backtest_precision_hit(
                 base_day=day,
                 lookback_days=int(lookback_days),
                 tau=int(tau),
-                min_games=int(thr_df.loc[thr_df["machine"].eq(m), "min_games"].iloc[0] if (thr_df["machine"].eq(m)).any() else min_games_fallback),
-                max_rb=float(thr_df.loc[thr_df["machine"].eq(m), "max_rb"].iloc[0] if (thr_df["machine"].eq(m)).any() else max_rb_fallback),
-                max_gassan=float(thr_df.loc[thr_df["machine"].eq(m), "max_gassan"].iloc[0] if (thr_df["machine"].eq(m)).any() else max_gassan_fallback),
+                min_games=mg,
+                max_rb=mrb,
+                max_gassan=mgs,
                 min_unique_days=int(min_unique_days),
                 w_unit=float(w_unit),
                 w_island=float(w_island),
@@ -419,12 +561,10 @@ def backtest_precision_hit(
             if df_day.empty:
                 continue
 
-            # baseline: overall good rate that day for that machine
             denom_all = int(df_day["unit_number"].nunique())
             good_all = int(df_day.drop_duplicates(subset=["unit_number"])["is_good_day"].sum())
             baseline = (good_all / denom_all) if denom_all > 0 else np.nan
 
-            # selected order by final_score
             rank_units = ranking["unit_number"].dropna().astype(int).tolist()
 
             for N in top_ns:
@@ -459,7 +599,6 @@ def backtest_precision_hit(
 
     detail = pd.DataFrame(rows)
 
-    # overall summary by N
     overall = []
     for N, g in detail.groupby("topN"):
         total_sel = int(g["selected_n"].sum())
@@ -482,7 +621,6 @@ def backtest_precision_hit(
         })
     overall_df = pd.DataFrame(overall).sort_values("topN")
 
-    # per-machine summary by N
     per_machine = []
     for (m, N), g in detail.groupby(["machine","topN"]):
         total_sel = int(g["selected_n"].sum())
@@ -507,187 +645,6 @@ def backtest_precision_hit(
     per_machine_df = pd.DataFrame(per_machine).sort_values(["topN","lift_pt"], ascending=[True, False])
 
     return detail, overall_df, per_machine_df
-
-# ========= Core ranking =========
-def build_ranking(
-    df_all: pd.DataFrame,
-    shop: str,
-    machine: str,
-    base_day: date,
-    lookback_days: int,
-    tau: int,
-    min_games: int,
-    max_rb: float,
-    max_gassan: float,
-    min_unique_days: int,
-    # weights
-    w_unit: float,
-    w_island: float,
-    w_run: float,
-    w_end: float,
-):
-    """
-    base_day を基準に、(base_day-lookback_days)〜(base_day-1) のデータだけでランキングを作る
-    ※ base_day 当日のデータは学習に使わない（リーク防止）
-
-    重要：
-    - 島マスタ列が無い場合でも落ちないようにしてある
-      -> island_score/run_score/end_bonus は 0 として扱う（台単体のみ）
-    """
-    if df_all.empty:
-        return pd.DataFrame()
-
-    df = df_all.copy()
-    df = df[df["date"].notna()].copy()
-
-    start_day = (pd.to_datetime(base_day) - pd.Timedelta(days=int(lookback_days))).date()
-    end_day = (pd.to_datetime(base_day) - pd.Timedelta(days=1)).date()
-
-    df = df[(df["date"] >= start_day) & (df["date"] <= end_day)].copy()
-    df = df[(df["shop"] == shop) & (df["machine"] == machine)].copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    # 島列が無い場合は作る（落ちないように）
-    for c in ["island_id","side","pos","edge_type","is_end"]:
-        if c not in df.columns:
-            df[c] = np.nan
-    if "is_end" in df.columns:
-        df["is_end"] = pd.to_numeric(df["is_end"], errors="coerce").fillna(0).astype(int)
-
-    # 数値化
-    df["unit_number"] = pd.to_numeric(df["unit_number"], errors="coerce")
-    df = df[df["unit_number"].notna()].copy()
-    df["unit_number"] = df["unit_number"].astype(int)
-
-    df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
-    df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
-    df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
-
-    # 減衰重み（直近重視）
-    df["days_ago"] = (pd.to_datetime(base_day) - pd.to_datetime(df["date"])).dt.days
-    df["w"] = np.exp(-df["days_ago"] / max(int(tau), 1))
-
-    # 良台日判定（正解の定義）
-    df["is_good_day"] = (
-        (df["total_start_num"] >= min_games) &
-        (df["rb_rate_num"] <= max_rb) &
-        (df["gassan_rate_num"] <= max_gassan)
-    ).astype(int)
-
-    # -------------------------
-    # ① 台単体（unit）集計
-    # -------------------------
-    gcols = ["shop", "machine", "unit_number"]
-    agg_u = df.groupby(gcols, dropna=False).agg(
-        samples=("date", "count"),
-        unique_days=("date", "nunique"),
-        w_sum=("w", "sum"),
-        good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
-        good_days=("is_good_day", "sum"),
-        avg_rb=("rb_rate_num", "mean"),
-        avg_gassan=("gassan_rate_num", "mean"),
-        max_total=("total_start_num", "max"),
-        island_id=("island_id", "first"),
-        side=("side", "first"),
-        pos=("pos", "first"),
-        edge_type=("edge_type", "first"),
-        is_end=("is_end", "first"),
-    ).reset_index()
-
-    # ブレ対策（サンプル不足排除）
-    agg_u = agg_u[agg_u["unique_days"] >= int(min_unique_days)].copy()
-    if agg_u.empty:
-        return pd.DataFrame()
-
-    agg_u["good_rate_weighted"] = (agg_u["good_w"] / agg_u["w_sum"]).replace([np.inf, -np.inf], np.nan)
-    agg_u["good_rate_simple"] = (agg_u["good_days"] / agg_u["unique_days"]).replace([np.inf, -np.inf], np.nan)
-
-    # 信頼度（重み合計が大きいほど信頼）
-    wmax = float(agg_u["w_sum"].max() if agg_u["w_sum"].notna().any() else 0.0)
-    trust = np.log1p(agg_u["w_sum"].fillna(0.0)) / np.log1p(wmax + 1e-9) if wmax > 0 else 0.0
-
-    # 台単体スコア（0〜1）
-    agg_u["unit_score"] = (
-        (agg_u["good_rate_weighted"].fillna(0.0) * 1.0) * 0.70 +
-        (trust * 1.0) * 0.30
-    )
-
-    out = agg_u.copy()
-
-    # -------------------------
-    # ② 島スコア（island_score） - island_id が無いなら 0
-    # -------------------------
-    if out["island_id"].isna().all():
-        out["island_score"] = 0.0
-    else:
-        agg_i = df.groupby(["shop","machine","island_id"], dropna=False).agg(
-            i_w_sum=("w", "sum"),
-            i_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
-        ).reset_index()
-        agg_i["island_score"] = (agg_i["i_good_w"] / agg_i["i_w_sum"]).replace([np.inf,-np.inf], np.nan).fillna(0.0)
-        out = out.merge(
-            agg_i[["shop","machine","island_id","island_score"]],
-            on=["shop","machine","island_id"],
-            how="left"
-        )
-        out["island_score"] = out["island_score"].fillna(0.0)
-
-    # -------------------------
-    # ③ 並びスコア（run_score） - pos/side が無いなら 0
-    # -------------------------
-    if out["pos"].isna().all() or out["side"].isna().all():
-        out["run_score"] = 0.0
-    else:
-        tmp = out.sort_values(["island_id","side","pos"]).copy()
-        tmp["pos"] = pd.to_numeric(tmp["pos"], errors="coerce")
-        tmp["unit_score_prev"] = tmp.groupby(["island_id","side"])["unit_score"].shift(1)
-        tmp["unit_score_next"] = tmp.groupby(["island_id","side"])["unit_score"].shift(-1)
-        tmp["run_score"] = tmp[["unit_score_prev","unit_score_next"]].mean(axis=1, skipna=True).fillna(0.0)
-        out = out.merge(tmp[["unit_number","run_score"]], on="unit_number", how="left")
-        out["run_score"] = out["run_score"].fillna(0.0)
-
-    # -------------------------
-    # ④ 端ボーナス（end_bonus）
-    # -------------------------
-    out["end_bonus"] = (pd.to_numeric(out["is_end"], errors="coerce").fillna(0).astype(int) > 0).astype(float)
-
-    # -------------------------
-    # ⑤ 最終スコア（正規化）
-    # -------------------------
-    ws = float(w_unit + w_island + w_run + w_end)
-    if ws <= 0:
-        ws = 1.0
-    wu, wi, wr, we = (w_unit/ws, w_island/ws, w_run/ws, w_end/ws)
-
-    out["final_score"] = (
-        out["unit_score"].fillna(0.0) * wu +
-        out["island_score"].fillna(0.0) * wi +
-        out["run_score"].fillna(0.0) * wr +
-        out["end_bonus"].fillna(0.0) * we
-    )
-
-    # 表示整形
-    out["good_rate_weighted"] = (out["good_rate_weighted"] * 100).round(1)
-    out["good_rate_simple"] = (out["good_rate_simple"] * 100).round(1)
-
-    for c in ["unit_score","island_score","run_score","end_bonus","final_score"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce").round(3)
-
-    out["avg_rb"] = pd.to_numeric(out["avg_rb"], errors="coerce").round(1)
-    out["avg_gassan"] = pd.to_numeric(out["avg_gassan"], errors="coerce").round(1)
-
-    out = out.sort_values(
-        ["final_score","island_score","run_score","unit_score","w_sum"],
-        ascending=[False, False, False, False, False]
-    ).reset_index(drop=True)
-
-    out["rank"] = np.arange(1, len(out) + 1)
-    out["train_start"] = start_day
-    out["train_end"] = end_day
-    out["weights"] = f"unit={wu:.2f},island={wi:.2f},run={wr:.2f},end={we:.2f}"
-
-    return out
 
 # ========= Sidebar =========
 if "min_games" not in st.session_state:
@@ -807,7 +764,6 @@ def upload_past_data_ui():
         st.info("ここに過去データを入れると、店×機種で候補台をランキングします。")
         return pd.DataFrame(columns=HEADER)
 
-    # サイドバー値（補完用）
     default_shop = shop
     default_date = d
     default_machine = machine
@@ -828,7 +784,6 @@ def upload_past_data_ui():
         st.error("CSVが読み込めませんでした（中身が空/形式違いの可能性）。")
         return pd.DataFrame(columns=HEADER)
 
-    # 統合時の重複除去
     do_dedup = st.checkbox(
         "統合時に重複行を除去（date+shop+machine+unit_number が同一なら最後の行を採用）",
         value=True,
@@ -837,7 +792,6 @@ def upload_past_data_ui():
     if do_dedup:
         df_all = df_all.drop_duplicates(subset=["date","shop","machine","unit_number"], keep="last").copy()
 
-    # ---- ファイル統合機能 ----
     st.subheader("0) ファイル統合（analysis用 unified.csv を作成）")
     st.write(f"統合結果：**{len(df_all)} 行**（列：{len(df_all.columns)}）")
 
@@ -891,31 +845,6 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 with tab1:
-    with st.expander("候補テーブルの見方（用語説明）", expanded=False):
-        st.markdown("""
-- **rank**：最終順位（final_scoreの高い順）
-- **unit_number**：台番号
-
-- **island_id / side / pos**：島マスタによる実配置（島 / 列 / 列内位置）
-- **edge_type**：wall / aisle / center
-- **is_end**：列の端（1=端、0=端以外）
-
-- **final_score**：最終スコア（朝イチ優先度の結論）
-- 島マスタあり：島/並び/端 + 台単体 を合成（重みはサイドバー）
-- 島マスタなし：台単体のみ（島/並び/端は 0 として扱う）
-
-- **unit_score**：その台“単体”の強さ（良台率＋信頼度）
-- **island_score**：その島が強いか（島全体の良台率）
-- **run_score**：同じ列(side)で両隣(pos±1)が強いか（並び）
-- **end_bonus**：端ボーナス（端なら1.0）
-
-- **good_rate_weighted(%)**：直近重視の良台率（新しい日ほど重く評価）
-- **good_rate_simple(%)**：単純な良台率（期間を均等に扱う）
-- **unique_days**：データに登場した日数（少ないとブレる）
-- **w_sum**：減衰込みの学習量（大きいほど信頼）
-- **avg_rb / avg_gassan / max_total**：参考値
-""")
-
     st.subheader("① 朝イチ候補（過去の original.csv を集計してランキング）")
 
     if df_all_shared.empty:
@@ -1064,8 +993,44 @@ with tab2:
         st.dataframe(preview_df.tail(5), use_container_width=True, hide_index=True)
 
 with tab3:
-    st.subheader("③ バックテスト（ツールの精度検証：上位Nの良台率 / lift / Hit@N）")
+    st.subheader("③ バックテスト（ツール精度検証：上位Nの良台率 / lift / Hit@N）")
     st.caption("※ その日を予測する際、学習には前日までのデータのみ使用（リーク防止）。良台判定は機種別RECOMMENDED（無い機種はサイドバー値）を使用。")
+
+    # ★ここが追加：指標の説明UI
+    with st.expander("指標の説明（クリックで開く）", expanded=False):
+        st.markdown("""
+### このバックテストがやっていること
+- ある日 **D** を評価したい  
+- 学習は **Dより前の日だけ** を使う（当日データは使わない＝リーク防止）  
+- 学習データでランキングを作り、当日Dの結果（良台だったか）で採点します
+
+### 良台日（当たり）の定義
+**min_games / max_rb / max_gassan** を満たす台を **良台（=1）** として扱います。
+
+### 各指標の意味
+- **topN**：ランキング上位から「何台を見るか」（Top10なら上位10台）
+- **selected_n**：その評価ケースで実際にTopNとして扱えた台数（通常N。候補不足でN未満になることがあります）
+- **good_in_topN**：TopNの中に「良台（当たり）」が何台あったか
+- **precision_topN**：TopNの良台率  
+  `good_in_topN / selected_n`  
+  → 「上位Nに座ったとき、当たりに触れる割合」
+- **all_units_n**：その日その機種の全台数
+- **good_all**：その日その機種の良台（当たり）総数
+- **baseline_good_rate**：その日その機種の全体良台率（店の地合い）  
+  `good_all / all_units_n`  
+  → 「その日はそもそも当たりが多い日だったか」
+- **lift_pt**：TopNが平均よりどれだけ有利か（ポイント差）  
+  `precision_topN - baseline_good_rate`  
+  → プラスなら「ツール上位が平均より当たりやすい」
+- **hit_at_N**：TopNの中に当たりが1台でもあれば1、なければ0
+- **hit_rate**：hit_at_Nの平均  
+  → 「TopNを見れば、当たりが混ざっている日がどれくらいあるか」
+
+### 実戦的に何を見るべき？
+- **lift_pt**：ツールを使う価値（平均より当たりを寄せているか）
+- **hit_rate**：朝イチで“とりあえず当たり候補がある”確率（実戦向き）
+- **precision_topN**：当たりの濃さ（効率よく当たりに触れたいなら重要）
+""")
 
     if df_all_shared.empty:
         st.info("まずは『共通：過去データアップロード』に統合データを投入してください。")
@@ -1133,7 +1098,6 @@ with tab3:
             st.error("バックテスト結果が生成できませんでした（評価期間が短い / サンプル不足 / データ欠損の可能性）。")
             st.stop()
 
-        # 表示整形
         overall_show = overall_df.copy()
         for c in ["precision_topN","baseline_good_rate","lift_pt","hit_rate"]:
             overall_show[c] = pd.to_numeric(overall_show[c], errors="coerce")
@@ -1149,7 +1113,6 @@ with tab3:
             hide_index=True
         )
 
-        # best N by lift
         best = overall_show.sort_values("lift_pt", ascending=False).head(1)
         if not best.empty:
             bN = int(best["topN"].iloc[0])
