@@ -1,8 +1,6 @@
 import io
 import re
 import zipfile
-from typing import Optional, List, Tuple, Dict
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -10,10 +8,11 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 # ========= Config =========
+# ★ weekday を追加（統合時に date から自動生成）
 HEADER = [
-    "date", "shop", "machine",
-    "unit_number", "start_games", "total_start", "bb_count", "rb_count", "art_count", "max_medals",
-    "bb_rate", "rb_rate", "art_rate", "gassan_rate", "prev_day_end"
+    "date","weekday","shop","machine",
+    "unit_number","start_games","total_start","bb_count","rb_count","art_count","max_medals",
+    "bb_rate","rb_rate","art_rate","gassan_rate","prev_day_end"
 ]
 
 SHOP_PRESETS = ["武蔵境", "吉祥寺", "三鷹", "国分寺", "新宿", "渋谷"]
@@ -41,31 +40,6 @@ RECOMMENDED = {
     "ウルトラミラクルジャグラー": {"min_games": 2800, "max_rb": 300.0, "max_gassan": 185.0},
 }
 
-# ========= CSV loader（文字コードフォールバック） =========
-def read_csv_flexible(file_like) -> pd.DataFrame:
-    """
-    Streamlit Cloud + 日本語CSV対策：
-    1) utf-8-sig
-    2) cp932
-    3) デフォルト
-    """
-    last_err = None
-    for enc in ["utf-8-sig", "cp932", None]:
-        try:
-            if enc is None:
-                return pd.read_csv(file_like)
-            return pd.read_csv(file_like, encoding=enc)
-        except Exception as e:
-            last_err = e
-            try:
-                # 再読込できるように巻き戻し
-                if hasattr(file_like, "seek"):
-                    file_like.seek(0)
-            except Exception:
-                pass
-    raise last_err
-
-
 # ========= Helpers =========
 def parse_rate_token(tok: str) -> float:
     """ '1/186.3' -> 186.3 , '186.3' -> 186.3 """
@@ -82,7 +56,6 @@ def parse_rate_token(tok: str) -> float:
     except ValueError:
         return np.nan
 
-
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = df.columns.astype(str).str.strip()
     rename_map = {
@@ -93,16 +66,16 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "BB確率": "bb_rate", "RB確率": "rb_rate", "ART確率": "art_rate",
         "合成確率": "gassan_rate", "前日最終": "prev_day_end",
         "店舗": "shop", "機種": "machine", "日付": "date",
+        "曜日": "weekday",
     }
     return df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
 
-
 def compute_rates_if_needed(df: pd.DataFrame) -> pd.DataFrame:
-    for c in ["unit_number", "start_games", "total_start", "bb_count", "rb_count", "art_count", "max_medals", "prev_day_end"]:
+    for c in ["unit_number","start_games","total_start","bb_count","rb_count","art_count","max_medals","prev_day_end"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ""), errors="coerce")
 
-    for c in ["bb_rate", "rb_rate", "art_rate", "gassan_rate"]:
+    for c in ["bb_rate","rb_rate","art_rate","gassan_rate"]:
         if c not in df.columns:
             df[c] = np.nan
 
@@ -122,9 +95,24 @@ def compute_rates_if_needed(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+# ========= ★追加：weekday 自動生成 =========
+JP_WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
+
+def add_weekday_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    date から weekday（'月'〜'日'）を自動生成。
+    既にweekdayがあっても、dateが取れている行は上書きして整合させます（統合時の品質優先）。
+    """
+    out = df.copy()
+    if "date" not in out.columns:
+        out["date"] = pd.NaT
+    dt = pd.to_datetime(out["date"], errors="coerce")
+    wd = dt.dt.dayofweek  # 0=Mon
+    out["weekday"] = wd.map(lambda x: JP_WEEKDAYS[int(x)] if pd.notna(x) else np.nan)
+    return out
 
 # ========= 統合用：ファイル名から date / machine を推定 =========
-def parse_date_machine_from_filename(filename: str) -> Tuple[Optional[date], Optional[str]]:
+def parse_date_machine_from_filename(filename: str):
     """
     例：
       2025-12-16_マイジャグラーV_original.csv
@@ -143,8 +131,7 @@ def parse_date_machine_from_filename(filename: str) -> Tuple[Optional[date], Opt
     machine_hint = m.group(2)
     return (date_hint, machine_hint)
 
-
-def fill_missing_meta(df: pd.DataFrame, date_hint: Optional[date], shop_hint: str, machine_hint: Optional[str]) -> pd.DataFrame:
+def fill_missing_meta(df: pd.DataFrame, date_hint, shop_hint, machine_hint) -> pd.DataFrame:
     """date/shop/machine が欠損なら補完（行単位で欠損だけ埋める）"""
     out = df.copy()
 
@@ -179,13 +166,12 @@ def fill_missing_meta(df: pd.DataFrame, date_hint: Optional[date], shop_hint: st
 
     return out
 
-
-def load_many_csvs(files, default_shop: str, default_date: Optional[date] = None, default_machine: Optional[str] = None) -> pd.DataFrame:
+def load_many_csvs(files, default_shop: str, default_date=None, default_machine: str | None = None) -> pd.DataFrame:
     dfs = []
     for f in files:
         date_hint, machine_hint = parse_date_machine_from_filename(getattr(f, "name", ""))
 
-        df = read_csv_flexible(f)
+        df = pd.read_csv(f)
         df = normalize_columns(df)
         df = compute_rates_if_needed(df)
 
@@ -201,15 +187,18 @@ def load_many_csvs(files, default_shop: str, default_date: Optional[date] = None
             machine_hint=machine_hint or default_machine,
         )
 
+        # dateの確定 → weekday自動生成
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = add_weekday_column(df)
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+
         dfs.append(df)
 
     if not dfs:
         return pd.DataFrame(columns=HEADER)
     return pd.concat(dfs, ignore_index=True)
 
-
-def load_zip_of_csv(zip_bytes: bytes, default_shop: str, default_date: Optional[date] = None, default_machine: Optional[str] = None) -> pd.DataFrame:
+def load_zip_of_csv(zip_bytes: bytes, default_shop: str, default_date=None, default_machine: str | None = None) -> pd.DataFrame:
     dfs = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         for name in z.namelist():
@@ -219,10 +208,7 @@ def load_zip_of_csv(zip_bytes: bytes, default_shop: str, default_date: Optional[
             date_hint, machine_hint = parse_date_machine_from_filename(name)
 
             with z.open(name) as fp:
-                # zip内はbytesなので一度BytesIOへ
-                raw = fp.read()
-                bio = io.BytesIO(raw)
-                df = read_csv_flexible(bio)
+                df = pd.read_csv(fp)
 
             df = normalize_columns(df)
             df = compute_rates_if_needed(df)
@@ -239,30 +225,30 @@ def load_zip_of_csv(zip_bytes: bytes, default_shop: str, default_date: Optional[
                 machine_hint=machine_hint or default_machine,
             )
 
+            # dateの確定 → weekday自動生成
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = add_weekday_column(df)
             df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+
             dfs.append(df)
 
     if not dfs:
         return pd.DataFrame(columns=HEADER)
     return pd.concat(dfs, ignore_index=True)
 
-
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
-
 
 def make_filename(machine: str, suffix: str, date_str: str) -> str:
     time_part = datetime.now(JST).strftime("%H-%M-%S")
     safe_machine = str(machine).replace(" ", "").replace("/", "_").replace("\\", "_").replace(":", "-")
     return f"{date_str}_{time_part}_{safe_machine}_{suffix}.csv"
 
-
 # ========= Island Master (island.csv) =========
-ISLAND_COLS = ["unit_number", "island_id", "side", "pos", "edge_type", "is_end"]
-
+ISLAND_COLS = ["unit_number","island_id","side","pos","edge_type","is_end"]
 
 def load_island_master(uploaded_file) -> pd.DataFrame:
-    dfm = read_csv_flexible(uploaded_file)
+    dfm = pd.read_csv(uploaded_file)
     missing = [c for c in ISLAND_COLS if c not in dfm.columns]
     if missing:
         raise ValueError(f"島マスタの列が不足しています: {missing}")
@@ -278,44 +264,41 @@ def load_island_master(uploaded_file) -> pd.DataFrame:
 
     return dfm[ISLAND_COLS].copy()
 
-
-def validate_island_master(dfm: pd.DataFrame) -> List[str]:
+def validate_island_master(dfm: pd.DataFrame) -> list[str]:
     errs = []
 
     if dfm["unit_number"].isna().any():
         errs.append("unit_number に欠損があります（数値に変換できない行がある）")
     if dfm["unit_number"].duplicated().any():
         errs.append("unit_number が重複しています")
-    if dfm.duplicated(["island_id", "side", "pos"]).any():
+    if dfm.duplicated(["island_id","side","pos"]).any():
         errs.append("(island_id, side, pos) が重複しています")
 
-    ok_edge = {"wall", "aisle", "center"}
+    ok_edge = {"wall","aisle","center"}
     if (~dfm["edge_type"].isin(ok_edge)).any():
         errs.append(f"edge_type は {sorted(list(ok_edge))} のみ対応です（不正値あり）")
 
-    ok_side = {"L", "R", "S"}
+    ok_side = {"L","R","S"}
     if (~dfm["side"].isin(ok_side)).any():
         errs.append("side は L/R/S のみ対応です（不正値あり）")
 
-    if (~dfm["is_end"].isin([0, 1])).any():
+    if (~dfm["is_end"].isin([0,1])).any():
         errs.append("is_end は 0/1 のみ対応です（不正値あり）")
 
-    # pos連番 + is_end
     dfm2 = dfm.dropna(subset=["pos"]).copy()
-    for (island, side), g in dfm2.groupby(["island_id", "side"]):
+    for (island, side), g in dfm2.groupby(["island_id","side"]):
         poss = sorted(g["pos"].astype(int).tolist())
         if not poss:
             continue
-        exp = list(range(1, max(poss) + 1))
+        exp = list(range(1, max(poss)+1))
         if poss != exp:
             errs.append(f"{island}-{side}: posが連番ではありません（欠番あり）")
         maxpos = max(poss)
-        end_bad = g[((g["pos"] == 1) | (g["pos"] == maxpos)) & (g["is_end"] != 1)]
+        end_bad = g[((g["pos"]==1) | (g["pos"]==maxpos)) & (g["is_end"]!=1)]
         if not end_bad.empty:
             errs.append(f"{island}-{side}: 端(pos=1 or {maxpos})なのに is_end!=1 の行があります")
 
     return errs
-
 
 def attach_island_info(df_all: pd.DataFrame, island_master: pd.DataFrame) -> pd.DataFrame:
     out = df_all.copy()
@@ -323,40 +306,31 @@ def attach_island_info(df_all: pd.DataFrame, island_master: pd.DataFrame) -> pd.
     out = out.merge(island_master, on="unit_number", how="left")
     return out
 
-
 # ========= Play Log (append to uploaded CSV) =========
 PLAYLOG_HEADER = [
     "created_at",
-    "date", "shop", "machine", "unit_number",
+    "date","shop","machine","unit_number",
     "tool_rank",
     "select_reason",
-    "start_time", "end_time",
-    "invest_medals", "payout_medals", "profit_medals",
+    "start_time","end_time",
+    "invest_medals","payout_medals","profit_medals",
     "play_games",
-    "stop_reason", "memo"
+    "stop_reason","memo"
 ]
 
-
 def append_row_to_uploaded_csv(uploaded_bytes: bytes, new_row: dict) -> bytes:
-    try:
-        df = pd.read_csv(io.BytesIO(uploaded_bytes))
-    except Exception:
-        df = pd.DataFrame(columns=PLAYLOG_HEADER)
-
+    df = pd.read_csv(io.BytesIO(uploaded_bytes))
     for c in PLAYLOG_HEADER:
         if c not in df.columns:
             df[c] = np.nan
     df = df[PLAYLOG_HEADER]
-
     df2 = pd.DataFrame([new_row], columns=PLAYLOG_HEADER)
     out = pd.concat([df, df2], ignore_index=True)
     return out.to_csv(index=False).encode("utf-8-sig")
 
-
 def make_log_filename(date_str: str) -> str:
     time_part = datetime.now(JST).strftime("%H-%M-%S")
     return f"{date_str}_{time_part}_playlog.csv"
-
 
 # ========= Backtest helpers =========
 def make_threshold_df(min_games_fallback: int, max_rb_fallback: float, max_gassan_fallback: float) -> pd.DataFrame:
@@ -364,27 +338,11 @@ def make_threshold_df(min_games_fallback: int, max_rb_fallback: float, max_gassa
     for m in MACHINE_PRESETS:
         rec = RECOMMENDED.get(m)
         if rec:
-            rows.append({
-                "machine": m,
-                "min_games": int(rec["min_games"]),
-                "max_rb": float(rec["max_rb"]),
-                "max_gassan": float(rec["max_gassan"]),
-            })
+            rows.append({"machine": m, "min_games": int(rec["min_games"]), "max_rb": float(rec["max_rb"]), "max_gassan": float(rec["max_gassan"])})
         else:
-            rows.append({
-                "machine": m,
-                "min_games": int(min_games_fallback),
-                "max_rb": float(max_rb_fallback),
-                "max_gassan": float(max_gassan_fallback),
-            })
-    rows.append({
-        "machine": "__DEFAULT__",
-        "min_games": int(min_games_fallback),
-        "max_rb": float(max_rb_fallback),
-        "max_gassan": float(max_gassan_fallback),
-    })
+            rows.append({"machine": m, "min_games": int(min_games_fallback), "max_rb": float(max_rb_fallback), "max_gassan": float(max_gassan_fallback)})
+    rows.append({"machine": "__DEFAULT__", "min_games": int(min_games_fallback), "max_rb": float(max_rb_fallback), "max_gassan": float(max_gassan_fallback)})
     return pd.DataFrame(rows)
-
 
 def add_is_good_day(df: pd.DataFrame, thr_df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -394,7 +352,7 @@ def add_is_good_day(df: pd.DataFrame, thr_df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.merge(thr_df, on="machine", how="left")
     fallback = thr_df[thr_df["machine"] == "__DEFAULT__"].iloc[0]
-    for c in ["min_games", "max_rb", "max_gassan"]:
+    for c in ["min_games","max_rb","max_gassan"]:
         out[c] = out[c].fillna(fallback[c])
 
     out["is_good_day"] = (
@@ -404,7 +362,6 @@ def add_is_good_day(df: pd.DataFrame, thr_df: pd.DataFrame) -> pd.DataFrame:
     ).astype(int)
 
     return out
-
 
 def build_ranking(
     df_all: pd.DataFrame,
@@ -436,7 +393,7 @@ def build_ranking(
     if df.empty:
         return pd.DataFrame()
 
-    for c in ["island_id", "side", "pos", "edge_type", "is_end"]:
+    for c in ["island_id","side","pos","edge_type","is_end"]:
         if c not in df.columns:
             df[c] = np.nan
     if "is_end" in df.columns:
@@ -493,32 +450,30 @@ def build_ranking(
 
     out = agg_u.copy()
 
-    # island_score
     if out["island_id"].isna().all():
         out["island_score"] = 0.0
     else:
-        agg_i = df.groupby(["shop", "machine", "island_id"], dropna=False).agg(
+        agg_i = df.groupby(["shop","machine","island_id"], dropna=False).agg(
             i_w_sum=("w", "sum"),
             i_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
         ).reset_index()
-        agg_i["island_score"] = (agg_i["i_good_w"] / agg_i["i_w_sum"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        agg_i["island_score"] = (agg_i["i_good_w"] / agg_i["i_w_sum"]).replace([np.inf,-np.inf], np.nan).fillna(0.0)
         out = out.merge(
-            agg_i[["shop", "machine", "island_id", "island_score"]],
-            on=["shop", "machine", "island_id"],
+            agg_i[["shop","machine","island_id","island_score"]],
+            on=["shop","machine","island_id"],
             how="left"
         )
         out["island_score"] = out["island_score"].fillna(0.0)
 
-    # run_score
     if out["pos"].isna().all() or out["side"].isna().all():
         out["run_score"] = 0.0
     else:
-        tmp = out.sort_values(["island_id", "side", "pos"]).copy()
+        tmp = out.sort_values(["island_id","side","pos"]).copy()
         tmp["pos"] = pd.to_numeric(tmp["pos"], errors="coerce")
-        tmp["unit_score_prev"] = tmp.groupby(["island_id", "side"])["unit_score"].shift(1)
-        tmp["unit_score_next"] = tmp.groupby(["island_id", "side"])["unit_score"].shift(-1)
-        tmp["run_score"] = tmp[["unit_score_prev", "unit_score_next"]].mean(axis=1, skipna=True).fillna(0.0)
-        out = out.merge(tmp[["unit_number", "run_score"]], on="unit_number", how="left")
+        tmp["unit_score_prev"] = tmp.groupby(["island_id","side"])["unit_score"].shift(1)
+        tmp["unit_score_next"] = tmp.groupby(["island_id","side"])["unit_score"].shift(-1)
+        tmp["run_score"] = tmp[["unit_score_prev","unit_score_next"]].mean(axis=1, skipna=True).fillna(0.0)
+        out = out.merge(tmp[["unit_number","run_score"]], on="unit_number", how="left")
         out["run_score"] = out["run_score"].fillna(0.0)
 
     out["end_bonus"] = (pd.to_numeric(out["is_end"], errors="coerce").fillna(0).astype(int) > 0).astype(float)
@@ -526,7 +481,7 @@ def build_ranking(
     ws = float(w_unit + w_island + w_run + w_end)
     if ws <= 0:
         ws = 1.0
-    wu, wi, wr, we = (w_unit / ws, w_island / ws, w_run / ws, w_end / ws)
+    wu, wi, wr, we = (w_unit/ws, w_island/ws, w_run/ws, w_end/ws)
 
     out["final_score"] = (
         out["unit_score"].fillna(0.0) * wu +
@@ -538,14 +493,14 @@ def build_ranking(
     out["good_rate_weighted"] = (out["good_rate_weighted"] * 100).round(1)
     out["good_rate_simple"] = (out["good_rate_simple"] * 100).round(1)
 
-    for c in ["unit_score", "island_score", "run_score", "end_bonus", "final_score"]:
+    for c in ["unit_score","island_score","run_score","end_bonus","final_score"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(3)
 
     out["avg_rb"] = pd.to_numeric(out["avg_rb"], errors="coerce").round(1)
     out["avg_gassan"] = pd.to_numeric(out["avg_gassan"], errors="coerce").round(1)
 
     out = out.sort_values(
-        ["final_score", "island_score", "run_score", "unit_score", "w_sum"],
+        ["final_score","island_score","run_score","unit_score","w_sum"],
         ascending=[False, False, False, False, False]
     ).reset_index(drop=True)
 
@@ -555,11 +510,10 @@ def build_ranking(
     out["weights"] = f"unit={wu:.2f},island={wi:.2f},run={wr:.2f},end={we:.2f}"
     return out
 
-
 def backtest_precision_hit(
     df_all: pd.DataFrame,
     shop: str,
-    machines: List[str],
+    machines: list[str],
     lookback_days: int,
     tau: int,
     min_unique_days: int,
@@ -570,9 +524,9 @@ def backtest_precision_hit(
     min_games_fallback: int,
     max_rb_fallback: float,
     max_gassan_fallback: float,
-    top_ns: List[int],
-    eval_start: Optional[date],
-    eval_end: Optional[date],
+    top_ns: list[int],
+    eval_start: date | None,
+    eval_end: date | None,
 ):
     if df_all.empty:
         return None, None, None
@@ -693,7 +647,7 @@ def backtest_precision_hit(
     overall_df = pd.DataFrame(overall).sort_values("topN")
 
     per_machine = []
-    for (m, N), g in detail.groupby(["machine", "topN"]):
+    for (m, N), g in detail.groupby(["machine","topN"]):
         total_sel = int(g["selected_n"].sum())
         total_good_sel = int(g["good_in_topN"].sum())
         precision = (total_good_sel / total_sel) if total_sel > 0 else np.nan
@@ -713,10 +667,9 @@ def backtest_precision_hit(
             "lift_pt": (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan,
             "hit_rate": hit_rate,
         })
-    per_machine_df = pd.DataFrame(per_machine).sort_values(["topN", "lift_pt"], ascending=[True, False])
+    per_machine_df = pd.DataFrame(per_machine).sort_values(["topN","lift_pt"], ascending=[True, False])
 
     return detail, overall_df, per_machine_df
-
 
 # ========= Sidebar =========
 if "min_games" not in st.session_state:
@@ -726,7 +679,6 @@ if "max_rb" not in st.session_state:
 if "max_gassan" not in st.session_state:
     st.session_state["max_gassan"] = 195.0
 
-
 def apply_recommended(machine_name: str):
     rec = RECOMMENDED.get(machine_name)
     if not rec:
@@ -734,7 +686,6 @@ def apply_recommended(machine_name: str):
     st.session_state["min_games"] = int(rec["min_games"])
     st.session_state["max_rb"] = float(rec["max_rb"])
     st.session_state["max_gassan"] = float(rec["max_gassan"])
-
 
 with st.sidebar:
     st.header("補完情報（date / shop / machine）")
@@ -754,7 +705,7 @@ with st.sidebar:
             MACHINE_PRESETS,
             index=0,
             key="machine_select",
-            on_change=lambda: apply_recommended(st.session_state.get("machine_select", MACHINE_PRESETS[0])),
+            on_change=lambda: apply_recommended(st.session_state["machine_select"]),
         )
         machine = st.session_state["machine_select"]
     else:
@@ -777,8 +728,8 @@ with st.sidebar:
     st.header("朝イチ候補スコア（島マスタ前提）")
 
     w_island = st.slider("島（island）の重み", 0.0, 1.0, 0.45, 0.05)
-    w_run = st.slider("並び（run）の重み", 0.0, 1.0, 0.35, 0.05)
-    w_end = st.slider("端（end）の重み", 0.0, 1.0, 0.10, 0.05)
+    w_run    = st.slider("並び（run）の重み",   0.0, 1.0, 0.35, 0.05)
+    w_end    = st.slider("端（end）の重み",     0.0, 1.0, 0.10, 0.05)
 
     w_unit = max(0.0, 1.0 - (w_island + w_run + w_end))
     st.caption(f"台単体の重み（自動の目安）: {w_unit:.2f}  ※ 合計が1を超えても内部で正規化します")
@@ -813,11 +764,11 @@ with st.sidebar:
     min_unique_days = st.number_input("最小サンプル日数（稼働日数）", 1, 60, 3, 1)
     top_n = st.number_input("上位N件表示（候補テーブル）", 1, 200, 30, 1)
 
-
 # --------- 共通：過去データの投入（＋統合DL機能） ---------
 def upload_past_data_ui():
     st.caption("複数CSV（original.csv）または zip（CSVをまとめたもの）をアップロードしてください。")
     st.caption("※ date/shop/machine がCSV内に無い場合：ファイル名（YYYY-MM-DD_機種...）→無ければサイドバー値で補完します。")
+    st.caption("★ weekday は『統合時に date から自動生成』します（入力不要）")
 
     colA, colB = st.columns(2)
     with colA:
@@ -859,13 +810,18 @@ def upload_past_data_ui():
         st.error("CSVが読み込めませんでした（中身が空/形式違いの可能性）。")
         return pd.DataFrame(columns=HEADER)
 
+    # 念のため：統合後にもう一度 weekday を整合（date欠損が埋まったケース対策）
+    df_all["date"] = pd.to_datetime(df_all["date"], errors="coerce")
+    df_all = add_weekday_column(df_all)
+    df_all["date"] = pd.to_datetime(df_all["date"], errors="coerce").dt.date
+
     do_dedup = st.checkbox(
         "統合時に重複行を除去（date+shop+machine+unit_number が同一なら最後の行を採用）",
         value=True,
         key="dedup_unified"
     )
     if do_dedup:
-        df_all = df_all.drop_duplicates(subset=["date", "shop", "machine", "unit_number"], keep="last").copy()
+        df_all = df_all.drop_duplicates(subset=["date","shop","machine","unit_number"], keep="last").copy()
 
     st.subheader("0) ファイル統合（analysis用 unified.csv を作成）")
     st.write(f"統合結果：**{len(df_all)} 行**（列：{len(df_all.columns)}）")
@@ -883,7 +839,6 @@ def upload_past_data_ui():
         st.dataframe(df_all.tail(20), use_container_width=True, hide_index=True)
 
     return df_all
-
 
 # ========= Main UI =========
 st.divider()
@@ -955,12 +910,12 @@ with tab1:
             show_cols = [
                 "rank",
                 "unit_number",
-                "island_id", "side", "pos", "edge_type", "is_end",
+                "island_id","side","pos","edge_type","is_end",
                 "final_score",
-                "island_score", "run_score", "unit_score", "end_bonus",
-                "good_rate_weighted", "good_rate_simple",
-                "unique_days", "samples", "w_sum",
-                "avg_rb", "avg_gassan", "max_total",
+                "island_score","run_score","unit_score","end_bonus",
+                "good_rate_weighted","good_rate_simple",
+                "unique_days","samples","w_sum",
+                "avg_rb","avg_gassan","max_total",
                 "weights"
             ]
             show_cols = [c for c in show_cols if c in ranking.columns]
@@ -1072,18 +1027,13 @@ with tab3:
     st.subheader("③ バックテスト（ツール精度検証：上位Nの良台率 / lift / Hit@N）")
     st.caption("※ その日を予測する際、学習には前日までのデータのみ使用（リーク防止）。良台判定は機種別RECOMMENDED（無い機種はサイドバー値）を使用。")
 
-    # 結果保持（session_state）
     if "bt_detail" not in st.session_state:
         st.session_state["bt_detail"] = None
-    if "bt_overall" not in st.session_state:
         st.session_state["bt_overall"] = None
-    if "bt_per_machine" not in st.session_state:
         st.session_state["bt_per_machine"] = None
-    if "bt_sig" not in st.session_state:
         st.session_state["bt_sig"] = None
 
     def _make_bt_signature():
-        """計算条件の署名（これが変わったら再実行推奨）"""
         try:
             top_ns_sig = tuple(int(x) for x in top_ns)
         except Exception:
@@ -1113,11 +1063,19 @@ with tab3:
 **min_games / max_rb / max_gassan** を満たす台を **良台（=1）** として扱います。
 
 ### 各指標の意味
-- **topN**：ランキング上位から「何台を見るか」
-- **precision_topN**：TopNの良台率
-- **baseline_good_rate**：その日その機種の全体良台率（店の地合い）
-- **lift_pt**：TopNが平均よりどれだけ有利か（ポイント差）
-- **hit_rate**：TopNの中に当たりが1台でもある確率
+- **topN**：ランキング上位から「何台を見るか」（Top10なら上位10台）
+- **selected_n**：その評価ケースで実際にTopNとして扱えた台数（通常N。候補不足でN未満になることがあります）
+- **good_in_topN**：TopNの中に「良台（当たり）」が何台あったか
+- **precision_topN**：TopNの良台率  `good_in_topN / selected_n`
+- **baseline_good_rate**：その日その機種の全体良台率（店の地合い） `good_all / all_units_n`
+- **lift_pt**：TopNが平均よりどれだけ有利か（ポイント差） `precision_topN - baseline_good_rate`
+- **hit_at_N**：TopNの中に当たりが1台でもあれば1、なければ0
+- **hit_rate**：hit_at_Nの平均（実戦向き）
+
+### 実戦的に何を見るべき？
+- **lift_pt**：ツールを使う価値（平均より当たりを寄せているか）
+- **hit_rate**：朝イチで“とりあえず当たり候補がある”確率
+- **precision_topN**：当たりの濃さ（効率よく当たりに触れたいなら重要）
 """)
 
     if df_all_shared.empty:
@@ -1166,6 +1124,7 @@ with tab3:
             st.stop()
 
     st.divider()
+
     c1, c2 = st.columns([3, 1])
     with c1:
         run_bt = st.button("バックテストを実行", type="primary", use_container_width=True)
@@ -1267,181 +1226,3 @@ with tab3:
         use_container_width=True,
         hide_index=True
     )
-
-    st.divider()
-    st.subheader("外れ日分析（特定の日に外れやすいかを見る）")
-
-    topN_options = sorted(det["topN"].dropna().unique().astype(int).tolist())
-    if not topN_options:
-        st.info("TopNの結果がありません。")
-        st.stop()
-
-    N_focus = st.selectbox(
-        "外れ日ランキングの対象TopN",
-        options=topN_options,
-        index=0,
-        key="bt_focus_topN_view"
-    )
-
-    detN = det[det["topN"] == int(N_focus)].copy()
-
-    def _daily_agg(g: pd.DataFrame) -> pd.Series:
-        total_sel = int(pd.to_numeric(g["selected_n"], errors="coerce").fillna(0).sum())
-        total_good_sel = int(pd.to_numeric(g["good_in_topN"], errors="coerce").fillna(0).sum())
-        precision = (total_good_sel / total_sel) if total_sel > 0 else np.nan
-
-        total_all = int(pd.to_numeric(g["all_units_n"], errors="coerce").fillna(0).sum())
-        total_good_all = int(pd.to_numeric(g["good_all"], errors="coerce").fillna(0).sum())
-        baseline = (total_good_all / total_all) if total_all > 0 else np.nan
-
-        hit_rate = float(pd.to_numeric(g["hit_at_N"], errors="coerce").mean()) if len(g) > 0 else np.nan
-        return pd.Series({
-            "eval_cases(machine数)": int(len(g)),
-            "selected_n_total": total_sel,
-            "good_in_topN_total": total_good_sel,
-            "precision_topN": precision,
-            "baseline_good_rate": baseline,
-            "lift_pt": (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan,
-            "hit_rate": hit_rate,
-        })
-
-    day_sum = detN.groupby("date", dropna=False).apply(_daily_agg).reset_index()
-
-    day_show = day_sum.copy()
-    day_show["precision_topN(%)"] = (pd.to_numeric(day_show["precision_topN"], errors="coerce") * 100).round(1)
-    day_show["baseline_good_rate(%)"] = (pd.to_numeric(day_show["baseline_good_rate"], errors="coerce") * 100).round(1)
-    day_show["lift_pt(%pt)"] = (pd.to_numeric(day_show["lift_pt"], errors="coerce") * 100).round(1)
-    day_show["hit_rate(%)"] = (pd.to_numeric(day_show["hit_rate"], errors="coerce") * 100).round(1)
-
-    colX, colY = st.columns([1, 1])
-    with colX:
-        k = st.number_input("外れ日ランキング表示件数（liftが低い順）", min_value=5, max_value=200, value=20, step=5, key="bt_bad_days_k_view")
-    with colY:
-        only_really_bad = st.checkbox("liftがマイナスの日だけに絞る", value=True, key="bt_only_bad_view")
-
-    bad_days = day_show.sort_values("lift_pt", ascending=True).copy()
-    if only_really_bad:
-        bad_days = bad_days[pd.to_numeric(bad_days["lift_pt"], errors="coerce") < 0].copy()
-
-    st.markdown(f"#### 外れ日ランキング（Top{int(N_focus)} / liftが低い順）")
-    if bad_days.empty:
-        st.info("条件に一致する外れ日がありません（lift<0 が無い、またはデータ不足）。")
-    else:
-        st.dataframe(
-            bad_days.head(int(k))[[
-                "date",
-                "eval_cases(machine数)",
-                "selected_n_total",
-                "good_in_topN_total",
-                "precision_topN(%)",
-                "baseline_good_rate(%)",
-                "lift_pt(%pt)",
-                "hit_rate(%)",
-            ]],
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.download_button(
-            "外れ日ランキング（CSV）をダウンロード",
-            data=bad_days.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{date_str}_bad_days_top{int(N_focus)}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="bt_dl_bad_days"
-        )
-
-    st.divider()
-    st.subheader("日別ヒートマップ（date × topN の lift）")
-    st.caption("lift(%pt)=（ツール上位の良台率）−（全体良台率）。緑ほど良く、赤ほど悪い日です。")
-
-    det2 = det.copy()
-    det2["selected_n"] = pd.to_numeric(det2["selected_n"], errors="coerce").fillna(0).astype(int)
-    det2["good_in_topN"] = pd.to_numeric(det2["good_in_topN"], errors="coerce").fillna(0).astype(int)
-    det2["all_units_n"] = pd.to_numeric(det2["all_units_n"], errors="coerce").fillna(0).astype(int)
-    det2["good_all"] = pd.to_numeric(det2["good_all"], errors="coerce").fillna(0).astype(int)
-
-    def _day_topN_agg(g: pd.DataFrame) -> pd.Series:
-        sel = int(g["selected_n"].sum())
-        good_sel = int(g["good_in_topN"].sum())
-        precision = (good_sel / sel) if sel > 0 else np.nan
-
-        alln = int(g["all_units_n"].sum())
-        good_all = int(g["good_all"].sum())
-        baseline = (good_all / alln) if alln > 0 else np.nan
-
-        lift = (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan
-        return pd.Series({"lift_pt": lift})
-
-    day_topN = det2.groupby(["date", "topN"], dropna=False).apply(_day_topN_agg).reset_index()
-    day_topN["lift_pt(%pt)"] = (pd.to_numeric(day_topN["lift_pt"], errors="coerce") * 100).round(1)
-
-    pivot = day_topN.pivot_table(index="date", columns="topN", values="lift_pt(%pt)", aggfunc="mean")
-
-    show_last = st.number_input("直近何日を表示する？（0なら全日）", min_value=0, max_value=9999, value=60, step=10, key="bt_heatmap_last_days_view")
-    pivot2 = pivot.copy()
-    if int(show_last) > 0 and len(pivot2) > int(show_last):
-        pivot2 = pivot2.tail(int(show_last))
-
-    st.markdown("#### ヒートマップ（テーブル色付け）")
-    try:
-        st.dataframe(
-            pivot2.style.format("{:.1f}").background_gradient(axis=None, cmap="RdYlGn"),
-            use_container_width=True
-        )
-    except Exception:
-        st.dataframe(pivot2, use_container_width=True)
-
-    st.download_button(
-        "日別ヒートマップ（pivot CSV）をダウンロード",
-        data=pivot.to_csv().encode("utf-8-sig"),
-        file_name=f"{date_str}_lift_heatmap_pivot.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key="bt_dl_heatmap"
-    )
-
-    st.divider()
-    st.subheader("バックテスト結果のダウンロード")
-    dl_zip = st.checkbox("詳細・サマリをzipでまとめてDL", value=True, key="bt_dl_zip")
-    if dl_zip:
-        mem = io.BytesIO()
-        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr(f"{date_str}_bt_overall.csv", overall_df.to_csv(index=False).encode("utf-8-sig"))
-            z.writestr(f"{date_str}_bt_per_machine.csv", per_machine_df.to_csv(index=False).encode("utf-8-sig"))
-            z.writestr(f"{date_str}_bt_detail.csv", detail.to_csv(index=False).encode("utf-8-sig"))
-            z.writestr(f"{date_str}_bt_bad_days_top{int(N_focus)}.csv", bad_days.to_csv(index=False).encode("utf-8-sig") if not bad_days.empty else b"")
-            z.writestr(f"{date_str}_bt_lift_heatmap_pivot.csv", pivot.to_csv().encode("utf-8-sig"))
-        st.download_button(
-            "バックテスト結果（zip）をダウンロード",
-            data=mem.getvalue(),
-            file_name=f"{date_str}_backtest_results.zip",
-            mime="application/zip",
-            use_container_width=True,
-            key="bt_dl_zip_btn"
-        )
-    else:
-        st.download_button(
-            "overallをCSVでDL",
-            data=overall_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{date_str}_bt_overall.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="bt_dl_overall"
-        )
-        st.download_button(
-            "per_machineをCSVでDL",
-            data=per_machine_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{date_str}_bt_per_machine.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="bt_dl_pm"
-        )
-        st.download_button(
-            "detailをCSVでDL",
-            data=detail.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{date_str}_bt_detail.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="bt_dl_detail"
-        )
