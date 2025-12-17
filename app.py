@@ -1027,31 +1027,16 @@ with tab3:
     st.subheader("③ バックテスト（ツール精度検証：上位Nの良台率 / lift / Hit@N）")
     st.caption("※ その日を予測する際、学習には前日までのデータのみ使用（リーク防止）。良台判定は機種別RECOMMENDED（無い機種はサイドバー値）を使用。")
 
+    # -----------------------------
+    # 0) 結果保持（session_state）
+    # -----------------------------
     if "bt_detail" not in st.session_state:
         st.session_state["bt_detail"] = None
         st.session_state["bt_overall"] = None
         st.session_state["bt_per_machine"] = None
         st.session_state["bt_sig"] = None
 
-    def _make_bt_signature():
-        try:
-            top_ns_sig = tuple(int(x) for x in top_ns)
-        except Exception:
-            top_ns_sig = tuple()
-        try:
-            machines_sig = tuple(sorted([str(x) for x in machines_bt]))
-        except Exception:
-            machines_sig = tuple()
-        return (
-            str(shop),
-            str(eval_start), str(eval_end),
-            top_ns_sig,
-            machines_sig,
-            int(lookback_days), int(tau), int(min_unique_days),
-            float(w_unit), float(w_island), float(w_run), float(w_end),
-            int(min_games), float(max_rb), float(max_gassan),
-        )
-
+    # 指標の説明（ヘルプ）
     with st.expander("指標の説明（クリックで開く）", expanded=False):
         st.markdown("""
 ### このバックテストがやっていること
@@ -1060,7 +1045,7 @@ with tab3:
 - 学習データでランキングを作り、当日Dの結果（良台だったか）で採点します
 
 ### 良台日（当たり）の定義
-**min_games / max_rb / max_gassan** を満たす台を **良台（=1）** として扱います。
+**min_games / max_rb / max_gassan** を満たす台を **良台（=1）** として扱います（機種別RECOMMENDEDがあればそれ優先）。
 
 ### 各指標の意味
 - **topN**：ランキング上位から「何台を見るか」（Top10なら上位10台）
@@ -1082,6 +1067,7 @@ with tab3:
         st.info("まずは『共通：過去データアップロード』に統合データを投入してください。")
         st.stop()
 
+    # shopフィルタ（存在チェック）
     df_tmp = df_all_shared.copy()
     df_tmp["date"] = pd.to_datetime(df_tmp["date"], errors="coerce").dt.date
     df_tmp = df_tmp[df_tmp["date"].notna()].copy()
@@ -1091,9 +1077,13 @@ with tab3:
         st.warning("この店名(shop)に一致するデータがありません。shop表記ゆれ（例：武蔵境/メッセ武蔵境）を確認してください。")
         st.stop()
 
+    # 評価可能な日付範囲
     all_days = sorted(df_tmp["date"].unique().tolist())
     min_day, max_day = all_days[0], all_days[-1]
 
+    # -----------------------------
+    # 1) 計算条件（ここを変えると再実行推奨）
+    # -----------------------------
     colA, colB, colC = st.columns(3)
     with colA:
         eval_start = st.date_input("評価開始日", value=min_day, min_value=min_day, max_value=max_day, key="bt_eval_start")
@@ -1125,6 +1115,9 @@ with tab3:
 
     st.divider()
 
+    # -----------------------------
+    # 2) 実行 / クリア
+    # -----------------------------
     c1, c2 = st.columns([3, 1])
     with c1:
         run_bt = st.button("バックテストを実行", type="primary", use_container_width=True)
@@ -1138,6 +1131,27 @@ with tab3:
         st.session_state["bt_sig"] = None
         st.rerun()
 
+    def _make_bt_signature():
+        """計算条件の署名（これが変わったら再実行推奨）"""
+        try:
+            top_ns_sig = tuple(int(x) for x in top_ns)
+        except Exception:
+            top_ns_sig = tuple()
+        try:
+            machines_sig = tuple(sorted([str(x) for x in machines_bt]))
+        except Exception:
+            machines_sig = tuple()
+        return (
+            str(shop),
+            str(eval_start), str(eval_end),
+            top_ns_sig,
+            machines_sig,
+            int(lookback_days), int(tau), int(min_unique_days),
+            float(w_unit), float(w_island), float(w_run), float(w_end),
+            int(min_games), float(max_rb), float(max_gassan),
+        )
+
+    # 実行時に計算して保存
     if run_bt:
         detail, overall_df, per_machine_df = backtest_precision_hit(
             df_all=df_all_shared,
@@ -1167,6 +1181,7 @@ with tab3:
         st.session_state["bt_per_machine"] = per_machine_df
         st.session_state["bt_sig"] = _make_bt_signature()
 
+    # 保存済み結果を読む（UI操作でrerunしても残る）
     detail = st.session_state["bt_detail"]
     overall_df = st.session_state["bt_overall"]
     per_machine_df = st.session_state["bt_per_machine"]
@@ -1175,13 +1190,18 @@ with tab3:
         st.info("まだバックテストが未実行です。上の『バックテストを実行』を押してください。")
         st.stop()
 
+    # 条件変更検知：結果が「前回条件のまま」なら警告だけ出す（表示は消さない）
     cur_sig = _make_bt_signature()
     if st.session_state["bt_sig"] is not None and st.session_state["bt_sig"] != cur_sig:
         st.warning("⚠️ 計算条件が変更されています。表示中の結果は『前回実行時の条件』のものです。必要なら再度『バックテストを実行』してください。")
 
+    # -----------------------------
+    # 3) サマリ表示（全体）
+    # -----------------------------
     overall_show = overall_df.copy()
     for c in ["precision_topN", "baseline_good_rate", "lift_pt", "hit_rate"]:
         overall_show[c] = pd.to_numeric(overall_show[c], errors="coerce")
+
     overall_show["precision_topN(%)"] = (overall_show["precision_topN"] * 100).round(1)
     overall_show["baseline_good_rate(%)"] = (overall_show["baseline_good_rate"] * 100).round(1)
     overall_show["lift_pt(%pt)"] = (overall_show["lift_pt"] * 100).round(1)
@@ -1199,10 +1219,14 @@ with tab3:
         bN = int(best["topN"].iloc[0])
         st.success(f"liftが最大のTopN：**Top{bN}**（lift={best['lift_pt(%pt)'].iloc[0]}%pt / Hit={best['hit_rate(%)'].iloc[0]}%）")
 
+    # -----------------------------
+    # 4) サマリ表示（機種別）
+    # -----------------------------
     st.subheader("結果サマリ（機種別）")
     pm = per_machine_df.copy()
     for c in ["precision_topN", "baseline_good_rate", "lift_pt", "hit_rate"]:
         pm[c] = pd.to_numeric(pm[c], errors="coerce")
+
     pm["precision_topN(%)"] = (pm["precision_topN"] * 100).round(1)
     pm["baseline_good_rate(%)"] = (pm["baseline_good_rate"] * 100).round(1)
     pm["lift_pt(%pt)"] = (pm["lift_pt"] * 100).round(1)
@@ -1214,6 +1238,9 @@ with tab3:
         hide_index=True
     )
 
+    # -----------------------------
+    # 5) 詳細（day × machine × topN）
+    # -----------------------------
     st.subheader("詳細（day × machine × topN）")
     det = detail.copy()
     det["date"] = pd.to_datetime(det["date"], errors="coerce").dt.date
@@ -1226,3 +1253,290 @@ with tab3:
         use_container_width=True,
         hide_index=True
     )
+
+    # ============================================================
+    # 6) 外れ日分析（特定の日に外れやすいかを見る）
+    # ============================================================
+    st.divider()
+    st.subheader("外れ日分析（特定の日に外れやすいかを見る）")
+
+    topN_options = sorted(det["topN"].dropna().unique().astype(int).tolist())
+    if not topN_options:
+        st.info("TopNの結果がありません。")
+        st.stop()
+
+    N_focus = st.selectbox(
+        "外れ日ランキングの対象TopN",
+        options=topN_options,
+        index=0,
+        key="bt_focus_topN_view"
+    )
+
+    detN = det[det["topN"] == int(N_focus)].copy()
+
+    def _daily_agg(g: pd.DataFrame) -> pd.Series:
+        total_sel = int(pd.to_numeric(g["selected_n"], errors="coerce").fillna(0).sum())
+        total_good_sel = int(pd.to_numeric(g["good_in_topN"], errors="coerce").fillna(0).sum())
+        precision = (total_good_sel / total_sel) if total_sel > 0 else np.nan
+
+        total_all = int(pd.to_numeric(g["all_units_n"], errors="coerce").fillna(0).sum())
+        total_good_all = int(pd.to_numeric(g["good_all"], errors="coerce").fillna(0).sum())
+        baseline = (total_good_all / total_all) if total_all > 0 else np.nan
+
+        hit_rate = float(pd.to_numeric(g["hit_at_N"], errors="coerce").mean()) if len(g) > 0 else np.nan
+        return pd.Series({
+            "eval_cases(machine数)": int(len(g)),
+            "selected_n_total": total_sel,
+            "good_in_topN_total": total_good_sel,
+            "precision_topN": precision,
+            "baseline_good_rate": baseline,
+            "lift_pt": (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan,
+            "hit_rate": hit_rate,
+        })
+
+    day_sum = detN.groupby("date", dropna=False).apply(_daily_agg).reset_index()
+
+    day_show = day_sum.copy()
+    day_show["precision_topN(%)"] = (pd.to_numeric(day_show["precision_topN"], errors="coerce") * 100).round(1)
+    day_show["baseline_good_rate(%)"] = (pd.to_numeric(day_show["baseline_good_rate"], errors="coerce") * 100).round(1)
+    day_show["lift_pt(%pt)"] = (pd.to_numeric(day_show["lift_pt"], errors="coerce") * 100).round(1)
+    day_show["hit_rate(%)"] = (pd.to_numeric(day_show["hit_rate"], errors="coerce") * 100).round(1)
+
+    colX, colY = st.columns([1, 1])
+    with colX:
+        k = st.number_input("外れ日ランキング表示件数（liftが低い順）", min_value=5, max_value=200, value=20, step=5, key="bt_bad_days_k_view")
+    with colY:
+        only_really_bad = st.checkbox("liftがマイナスの日だけに絞る", value=True, key="bt_only_bad_view")
+
+    bad_days = day_show.sort_values("lift_pt", ascending=True).copy()
+    if only_really_bad:
+        bad_days = bad_days[pd.to_numeric(bad_days["lift_pt"], errors="coerce") < 0].copy()
+
+    st.markdown(f"#### 外れ日ランキング（Top{int(N_focus)} / liftが低い順）")
+    if bad_days.empty:
+        st.info("条件に一致する外れ日がありません（lift<0 が無い、またはデータ不足）。")
+    else:
+        st.dataframe(
+            bad_days.head(int(k))[[
+                "date",
+                "eval_cases(machine数)",
+                "selected_n_total",
+                "good_in_topN_total",
+                "precision_topN(%)",
+                "baseline_good_rate(%)",
+                "lift_pt(%pt)",
+                "hit_rate(%)",
+            ]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.download_button(
+            "外れ日ランキング（CSV）をダウンロード",
+            data=bad_days.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{date_str}_bad_days_top{int(N_focus)}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="bt_dl_bad_days"
+        )
+
+    # ============================================================
+    # 7) 日別ヒートマップ（date × topN の lift_pt）※全機種平均（機種を合算）
+    # ============================================================
+    st.divider()
+    st.subheader("日別ヒートマップ（date × topN の lift）")
+    st.caption("lift(%pt)=（ツール上位の良台率）−（全体良台率）。プラスほどツールが効いています。")
+
+    det2 = detail.copy()
+    det2["date"] = pd.to_datetime(det2["date"], errors="coerce").dt.date
+
+    for c in ["selected_n", "good_in_topN", "all_units_n", "good_all", "topN"]:
+        det2[c] = pd.to_numeric(det2[c], errors="coerce")
+
+    det2["selected_n"] = det2["selected_n"].fillna(0).astype(int)
+    det2["good_in_topN"] = det2["good_in_topN"].fillna(0).astype(int)
+    det2["all_units_n"] = det2["all_units_n"].fillna(0).astype(int)
+    det2["good_all"] = det2["good_all"].fillna(0).astype(int)
+    det2["topN"] = det2["topN"].fillna(0).astype(int)
+
+    def _day_topN_agg(g: pd.DataFrame) -> pd.Series:
+        sel = int(g["selected_n"].sum())
+        good_sel = int(g["good_in_topN"].sum())
+        precision = (good_sel / sel) if sel > 0 else np.nan
+
+        alln = int(g["all_units_n"].sum())
+        good_all = int(g["good_all"].sum())
+        baseline = (good_all / alln) if alln > 0 else np.nan
+
+        lift = (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan
+        return pd.Series({"lift_pt": lift})
+
+    day_topN = (
+        det2.dropna(subset=["date"])
+        .groupby(["date", "topN"], dropna=False)
+        .apply(_day_topN_agg)
+        .reset_index()
+    )
+    day_topN["lift_pt(%pt)"] = (pd.to_numeric(day_topN["lift_pt"], errors="coerce") * 100).round(1)
+
+    pivot = day_topN.pivot_table(index="date", columns="topN", values="lift_pt(%pt)", aggfunc="mean")
+
+    show_last = st.number_input("直近何日を表示する？（0なら全日）", min_value=0, max_value=9999, value=60, step=10, key="bt_heatmap_last_days_view")
+    pivot2 = pivot.copy()
+    if int(show_last) > 0 and len(pivot2) > int(show_last):
+        pivot2 = pivot2.tail(int(show_last))
+
+    st.markdown("#### ヒートマップ（全機種合算）")
+    try:
+        st.dataframe(
+            pivot2.style.format("{:.1f}").background_gradient(axis=None, cmap="RdYlGn"),
+            use_container_width=True
+        )
+    except Exception:
+        st.dataframe(pivot2, use_container_width=True)
+
+    st.download_button(
+        "日別ヒートマップ（全機種合算 pivot CSV）をダウンロード",
+        data=pivot.to_csv().encode("utf-8-sig"),
+        file_name=f"{date_str}_lift_heatmap_pivot.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="bt_dl_heatmap"
+    )
+
+    # ============================================================
+    # 7B) 追加：機種別ヒートマップ（date × topN の lift_pt）
+    # ============================================================
+    st.divider()
+    st.subheader("機種別：日別TopN lift（date × topN）")
+    st.caption("機種を選ぶと、その機種だけの lift ヒートマップ（date × topN）を表示します。")
+
+    machines_in_detail = sorted(det2["machine"].dropna().unique().tolist())
+    if not machines_in_detail:
+        st.info("詳細に機種情報がありません。")
+        pivot_m = None
+    else:
+        m_focus = st.selectbox(
+            "表示する機種",
+            options=machines_in_detail,
+            index=0,
+            key="bt_heatmap_machine_focus"
+        )
+
+        detm = det2[det2["machine"] == m_focus].copy()
+
+        day_topN_m = (
+            detm.dropna(subset=["date"])
+            .groupby(["date", "topN"], dropna=False)
+            .apply(_day_topN_agg)
+            .reset_index()
+        )
+        day_topN_m["lift_pt(%pt)"] = (pd.to_numeric(day_topN_m["lift_pt"], errors="coerce") * 100).round(1)
+
+        pivot_m = day_topN_m.pivot_table(index="date", columns="topN", values="lift_pt(%pt)", aggfunc="mean")
+
+        show_last_m = st.number_input(
+            "直近何日を表示する？（0なら全日）",
+            min_value=0, max_value=9999, value=60, step=10,
+            key="bt_heatmap_last_days_machine_view"
+        )
+        pivot_m2 = pivot_m.copy()
+        if int(show_last_m) > 0 and len(pivot_m2) > int(show_last_m):
+            pivot_m2 = pivot_m2.tail(int(show_last_m))
+
+        st.markdown(f"#### ヒートマップ（機種別：{m_focus}）")
+        try:
+            st.dataframe(
+                pivot_m2.style.format("{:.1f}").background_gradient(axis=None, cmap="RdYlGn"),
+                use_container_width=True
+            )
+        except Exception:
+            st.dataframe(pivot_m2, use_container_width=True)
+
+        safe_m = str(m_focus).replace(" ", "").replace("/", "_").replace("\\", "_").replace(":", "-")
+        st.download_button(
+            f"機種別ヒートマップ（{m_focus} pivot CSV）をダウンロード",
+            data=pivot_m.to_csv().encode("utf-8-sig"),
+            file_name=f"{date_str}_lift_heatmap_pivot_{safe_m}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="bt_dl_heatmap_machine"
+        )
+
+    # ============================================================
+    # 8) ダウンロード（まとめてZIP / 個別CSV）
+    # ============================================================
+    st.divider()
+    st.subheader("バックテスト結果のダウンロード")
+
+    dl_zip = st.checkbox("詳細・サマリ・外れ日・ヒートマップをzipでまとめてDL", value=True, key="bt_dl_zip")
+    if dl_zip:
+        mem = io.BytesIO()
+        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr(f"{date_str}_bt_overall.csv", overall_df.to_csv(index=False).encode("utf-8-sig"))
+            z.writestr(f"{date_str}_bt_per_machine.csv", per_machine_df.to_csv(index=False).encode("utf-8-sig"))
+            z.writestr(f"{date_str}_bt_detail.csv", detail.to_csv(index=False).encode("utf-8-sig"))
+            z.writestr(f"{date_str}_bt_bad_days_top{int(N_focus)}.csv", (bad_days.to_csv(index=False).encode("utf-8-sig") if (bad_days is not None and not bad_days.empty) else b""))
+            z.writestr(f"{date_str}_bt_lift_heatmap_pivot.csv", pivot.to_csv().encode("utf-8-sig"))
+            if pivot_m is not None:
+                z.writestr(f"{date_str}_bt_lift_heatmap_pivot_machine.csv", pivot_m.to_csv().encode("utf-8-sig"))
+
+        st.download_button(
+            "バックテスト結果（zip）をダウンロード",
+            data=mem.getvalue(),
+            file_name=f"{date_str}_backtest_results.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="bt_dl_zip_btn"
+        )
+    else:
+        st.download_button(
+            "overallをCSVでDL",
+            data=overall_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{date_str}_bt_overall.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="bt_dl_overall"
+        )
+        st.download_button(
+            "per_machineをCSVでDL",
+            data=per_machine_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{date_str}_bt_per_machine.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="bt_dl_pm"
+        )
+        st.download_button(
+            "detailをCSVでDL",
+            data=detail.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{date_str}_bt_detail.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="bt_dl_detail"
+        )
+        if bad_days is not None and not bad_days.empty:
+            st.download_button(
+                f"bad_days(top{int(N_focus)})をCSVでDL",
+                data=bad_days.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{date_str}_bt_bad_days_top{int(N_focus)}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="bt_dl_bad_days2"
+            )
+        st.download_button(
+            "heatmap_pivot（全機種合算）をCSVでDL",
+            data=pivot.to_csv().encode("utf-8-sig"),
+            file_name=f"{date_str}_bt_lift_heatmap_pivot.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="bt_dl_heatmap2"
+        )
+        if pivot_m is not None:
+            st.download_button(
+                "heatmap_pivot（機種別）をCSVでDL",
+                data=pivot_m.to_csv().encode("utf-8-sig"),
+                file_name=f"{date_str}_bt_lift_heatmap_pivot_machine.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="bt_dl_heatmap_machine2"
+            )
