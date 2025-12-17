@@ -307,6 +307,207 @@ def make_log_filename(date_str: str) -> str:
     time_part = datetime.now(JST).strftime("%H-%M-%S")
     return f"{date_str}_{time_part}_playlog.csv"
 
+# ========= Backtest helpers =========
+def make_threshold_df(min_games_fallback: int, max_rb_fallback: float, max_gassan_fallback: float) -> pd.DataFrame:
+    rows = []
+    # known machines
+    for m in MACHINE_PRESETS:
+        rec = RECOMMENDED.get(m)
+        if rec:
+            rows.append({"machine": m, "min_games": int(rec["min_games"]), "max_rb": float(rec["max_rb"]), "max_gassan": float(rec["max_gassan"])})
+        else:
+            rows.append({"machine": m, "min_games": int(min_games_fallback), "max_rb": float(max_rb_fallback), "max_gassan": float(max_gassan_fallback)})
+    # safety: for any machine not in presets, fallback
+    rows.append({"machine": "__DEFAULT__", "min_games": int(min_games_fallback), "max_rb": float(max_rb_fallback), "max_gassan": float(max_gassan_fallback)})
+    return pd.DataFrame(rows)
+
+def add_is_good_day(df: pd.DataFrame, thr_df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["total_start_num"] = pd.to_numeric(out["total_start"], errors="coerce")
+    out["rb_rate_num"] = pd.to_numeric(out["rb_rate"], errors="coerce")
+    out["gassan_rate_num"] = pd.to_numeric(out["gassan_rate"], errors="coerce")
+
+    out = out.merge(thr_df, on="machine", how="left")
+    # fallback for unknown machines
+    fallback = thr_df[thr_df["machine"] == "__DEFAULT__"].iloc[0]
+    for c in ["min_games","max_rb","max_gassan"]:
+        out[c] = out[c].fillna(fallback[c])
+
+    out["is_good_day"] = (
+        (out["total_start_num"] >= out["min_games"]) &
+        (out["rb_rate_num"] <= out["max_rb"]) &
+        (out["gassan_rate_num"] <= out["max_gassan"])
+    ).astype(int)
+
+    return out
+
+def backtest_precision_hit(
+    df_all: pd.DataFrame,
+    shop: str,
+    machines: list[str],
+    lookback_days: int,
+    tau: int,
+    min_unique_days: int,
+    # ranking weights
+    w_unit: float,
+    w_island: float,
+    w_run: float,
+    w_end: float,
+    # good-day thresholds fallback
+    min_games_fallback: int,
+    max_rb_fallback: float,
+    max_gassan_fallback: float,
+    # eval params
+    top_ns: list[int],
+    eval_start: date | None,
+    eval_end: date | None,
+):
+    if df_all.empty:
+        return None, None, None
+
+    df = df_all.copy()
+    df = df[df["date"].notna()].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df = df[df["date"].notna()].copy()
+    df = df[df["shop"] == shop].copy()
+    if df.empty:
+        return None, None, None
+
+    # evaluation date range
+    all_days = sorted(df["date"].unique().tolist())
+    if not all_days:
+        return None, None, None
+
+    if eval_start is None:
+        eval_start = all_days[0]
+    if eval_end is None:
+        eval_end = all_days[-1]
+
+    eval_days = [d for d in all_days if (d >= eval_start and d <= eval_end)]
+    if not eval_days:
+        return None, None, None
+
+    # thresholds
+    thr_df = make_threshold_df(min_games_fallback, max_rb_fallback, max_gassan_fallback)
+    df_labeled = add_is_good_day(df, thr_df)
+
+    rows = []
+    # iterate each day and machine
+    for day in eval_days:
+        for m in machines:
+            # build ranking using ONLY past data (leak防止)
+            ranking = build_ranking(
+                df_all=df_all,
+                shop=shop,
+                machine=m,
+                base_day=day,
+                lookback_days=int(lookback_days),
+                tau=int(tau),
+                min_games=int(thr_df.loc[thr_df["machine"].eq(m), "min_games"].iloc[0] if (thr_df["machine"].eq(m)).any() else min_games_fallback),
+                max_rb=float(thr_df.loc[thr_df["machine"].eq(m), "max_rb"].iloc[0] if (thr_df["machine"].eq(m)).any() else max_rb_fallback),
+                max_gassan=float(thr_df.loc[thr_df["machine"].eq(m), "max_gassan"].iloc[0] if (thr_df["machine"].eq(m)).any() else max_gassan_fallback),
+                min_unique_days=int(min_unique_days),
+                w_unit=float(w_unit),
+                w_island=float(w_island),
+                w_run=float(w_run),
+                w_end=float(w_end),
+            )
+            if ranking is None or ranking.empty:
+                continue
+
+            df_day = df_labeled[(df_labeled["date"] == day) & (df_labeled["shop"] == shop) & (df_labeled["machine"] == m)].copy()
+            if df_day.empty:
+                continue
+
+            # baseline: overall good rate that day for that machine
+            denom_all = int(df_day["unit_number"].nunique())
+            good_all = int(df_day.drop_duplicates(subset=["unit_number"])["is_good_day"].sum())
+            baseline = (good_all / denom_all) if denom_all > 0 else np.nan
+
+            # selected order by final_score
+            rank_units = ranking["unit_number"].dropna().astype(int).tolist()
+
+            for N in top_ns:
+                chosen = rank_units[:int(N)]
+                if not chosen:
+                    continue
+
+                df_ch = df_day[df_day["unit_number"].astype("Int64").isin(chosen)].drop_duplicates(subset=["unit_number"])
+                denom_sel = int(len(chosen))
+                good_sel = int(df_ch["is_good_day"].sum())
+
+                precision = (good_sel / denom_sel) if denom_sel > 0 else np.nan
+                hit = 1 if good_sel > 0 else 0
+
+                rows.append({
+                    "date": day,
+                    "shop": shop,
+                    "machine": m,
+                    "topN": int(N),
+                    "selected_n": denom_sel,
+                    "good_in_topN": good_sel,
+                    "precision_topN": precision,
+                    "all_units_n": denom_all,
+                    "good_all": good_all,
+                    "baseline_good_rate": baseline,
+                    "lift_pt": (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan,
+                    "hit_at_N": hit,
+                })
+
+    if not rows:
+        return None, None, None
+
+    detail = pd.DataFrame(rows)
+
+    # overall summary by N
+    overall = []
+    for N, g in detail.groupby("topN"):
+        total_sel = int(g["selected_n"].sum())
+        total_good_sel = int(g["good_in_topN"].sum())
+        precision = (total_good_sel / total_sel) if total_sel > 0 else np.nan
+
+        total_all = int(g["all_units_n"].sum())
+        total_good_all = int(g["good_all"].sum())
+        baseline = (total_good_all / total_all) if total_all > 0 else np.nan
+
+        hit_rate = float(g["hit_at_N"].mean()) if len(g) > 0 else np.nan
+
+        overall.append({
+            "topN": int(N),
+            "eval_cases": int(len(g)),
+            "precision_topN": precision,
+            "baseline_good_rate": baseline,
+            "lift_pt": (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan,
+            "hit_rate": hit_rate,
+        })
+    overall_df = pd.DataFrame(overall).sort_values("topN")
+
+    # per-machine summary by N
+    per_machine = []
+    for (m, N), g in detail.groupby(["machine","topN"]):
+        total_sel = int(g["selected_n"].sum())
+        total_good_sel = int(g["good_in_topN"].sum())
+        precision = (total_good_sel / total_sel) if total_sel > 0 else np.nan
+
+        total_all = int(g["all_units_n"].sum())
+        total_good_all = int(g["good_all"].sum())
+        baseline = (total_good_all / total_all) if total_all > 0 else np.nan
+
+        hit_rate = float(g["hit_at_N"].mean()) if len(g) > 0 else np.nan
+
+        per_machine.append({
+            "machine": m,
+            "topN": int(N),
+            "eval_cases": int(len(g)),
+            "precision_topN": precision,
+            "baseline_good_rate": baseline,
+            "lift_pt": (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan,
+            "hit_rate": hit_rate,
+        })
+    per_machine_df = pd.DataFrame(per_machine).sort_values(["topN","lift_pt"], ascending=[True, False])
+
+    return detail, overall_df, per_machine_df
+
 # ========= Core ranking =========
 def build_ranking(
     df_all: pd.DataFrame,
@@ -328,7 +529,10 @@ def build_ranking(
     """
     base_day を基準に、(base_day-lookback_days)〜(base_day-1) のデータだけでランキングを作る
     ※ base_day 当日のデータは学習に使わない（リーク防止）
-    ※ 台番号のクセ（tail/block）は一切使わない（方式A）
+
+    重要：
+    - 島マスタ列が無い場合でも落ちないようにしてある
+      -> island_score/run_score/end_bonus は 0 として扱う（台単体のみ）
     """
     if df_all.empty:
         return pd.DataFrame()
@@ -344,12 +548,12 @@ def build_ranking(
     if df.empty:
         return pd.DataFrame()
 
-    # 島マスタ前提（必須）
-    required_island_cols = ["island_id","side","pos","edge_type","is_end"]
-    if not all(c in df.columns for c in required_island_cols):
-        raise ValueError("島マスタ列が不足しています。過去データに島マスタをJOINしてください。")
-    if df["island_id"].isna().all():
-        raise ValueError("島マスタがJOINされていません（island_idが全て欠損）。")
+    # 島列が無い場合は作る（落ちないように）
+    for c in ["island_id","side","pos","edge_type","is_end"]:
+        if c not in df.columns:
+            df[c] = np.nan
+    if "is_end" in df.columns:
+        df["is_end"] = pd.to_numeric(df["is_end"], errors="coerce").fillna(0).astype(int)
 
     # 数値化
     df["unit_number"] = pd.to_numeric(df["unit_number"], errors="coerce")
@@ -409,33 +613,39 @@ def build_ranking(
         (trust * 1.0) * 0.30
     )
 
-    # -------------------------
-    # ② 島スコア（island_score）
-    # -------------------------
-    agg_i = df.groupby(["shop","machine","island_id"], dropna=False).agg(
-        i_w_sum=("w", "sum"),
-        i_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
-    ).reset_index()
-    agg_i["island_score"] = (agg_i["i_good_w"] / agg_i["i_w_sum"]).replace([np.inf,-np.inf], np.nan).fillna(0.0)
-
-    out = agg_u.merge(
-        agg_i[["shop","machine","island_id","island_score"]],
-        on=["shop","machine","island_id"],
-        how="left"
-    )
-    out["island_score"] = out["island_score"].fillna(0.0)
+    out = agg_u.copy()
 
     # -------------------------
-    # ③ 並びスコア（run_score）
-    #     同じ島×同じ列(side)で pos±1 の unit_score 平均
+    # ② 島スコア（island_score） - island_id が無いなら 0
     # -------------------------
-    tmp = out.sort_values(["island_id","side","pos"]).copy()
-    tmp["pos"] = pd.to_numeric(tmp["pos"], errors="coerce")
-    tmp["unit_score_prev"] = tmp.groupby(["island_id","side"])["unit_score"].shift(1)
-    tmp["unit_score_next"] = tmp.groupby(["island_id","side"])["unit_score"].shift(-1)
-    tmp["run_score"] = tmp[["unit_score_prev","unit_score_next"]].mean(axis=1, skipna=True).fillna(0.0)
-    out = out.merge(tmp[["unit_number","run_score"]], on="unit_number", how="left")
-    out["run_score"] = out["run_score"].fillna(0.0)
+    if out["island_id"].isna().all():
+        out["island_score"] = 0.0
+    else:
+        agg_i = df.groupby(["shop","machine","island_id"], dropna=False).agg(
+            i_w_sum=("w", "sum"),
+            i_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
+        ).reset_index()
+        agg_i["island_score"] = (agg_i["i_good_w"] / agg_i["i_w_sum"]).replace([np.inf,-np.inf], np.nan).fillna(0.0)
+        out = out.merge(
+            agg_i[["shop","machine","island_id","island_score"]],
+            on=["shop","machine","island_id"],
+            how="left"
+        )
+        out["island_score"] = out["island_score"].fillna(0.0)
+
+    # -------------------------
+    # ③ 並びスコア（run_score） - pos/side が無いなら 0
+    # -------------------------
+    if out["pos"].isna().all() or out["side"].isna().all():
+        out["run_score"] = 0.0
+    else:
+        tmp = out.sort_values(["island_id","side","pos"]).copy()
+        tmp["pos"] = pd.to_numeric(tmp["pos"], errors="coerce")
+        tmp["unit_score_prev"] = tmp.groupby(["island_id","side"])["unit_score"].shift(1)
+        tmp["unit_score_next"] = tmp.groupby(["island_id","side"])["unit_score"].shift(-1)
+        tmp["run_score"] = tmp[["unit_score_prev","unit_score_next"]].mean(axis=1, skipna=True).fillna(0.0)
+        out = out.merge(tmp[["unit_number","run_score"]], on="unit_number", how="left")
+        out["run_score"] = out["run_score"].fillna(0.0)
 
     # -------------------------
     # ④ 端ボーナス（end_bonus）
@@ -443,7 +653,7 @@ def build_ranking(
     out["end_bonus"] = (pd.to_numeric(out["is_end"], errors="coerce").fillna(0).astype(int) > 0).astype(float)
 
     # -------------------------
-    # ⑤ 最終スコア（正規化して事故防止）
+    # ⑤ 最終スコア（正規化）
     # -------------------------
     ws = float(w_unit + w_island + w_run + w_end)
     if ws <= 0:
@@ -570,7 +780,7 @@ with st.sidebar:
     lookback_days = st.number_input("集計対象：過去何日（学習窓）", 1, 365, 60, 1)
     tau = st.number_input("日付減衰 τ（小さいほど直近重視）", 1, 120, 14, 1)
     min_unique_days = st.number_input("最小サンプル日数（稼働日数）", 1, 60, 3, 1)
-    top_n = st.number_input("上位N件表示", 1, 200, 30, 1)
+    top_n = st.number_input("上位N件表示（候補テーブル）", 1, 200, 30, 1)
 
 # --------- 共通：過去データの投入（＋統合DL機能） ---------
 def upload_past_data_ui():
@@ -655,7 +865,7 @@ island_file = st.file_uploader("島マスタ（island.csv）をアップロー�
 
 island_master = None
 if island_file is None:
-    st.info("島マスタが未指定です。島/並び/端の評価は使われません（末尾・台番帯中心のランキング）。")
+    st.info("島マスタが未指定です。島/並び/端の評価は 0 として扱い、台単体のみでランキングします。")
 else:
     try:
         island_master = load_island_master(island_file)
@@ -674,9 +884,10 @@ if (island_master is not None) and (not df_all_shared.empty):
     if miss:
         st.warning(f"島マスタに存在しない台番号が過去データに含まれています（例）: {miss[:10]}")
 
-tab1, tab2 = st.tabs([
+tab1, tab2, tab3 = st.tabs([
     "朝イチ候補（過去データ集計）",
-    "実戦ログ（CSVに追記して更新版DL）"
+    "実戦ログ（CSVに追記して更新版DL）",
+    "バックテスト（ツール精度検証）"
 ])
 
 with tab1:
@@ -690,15 +901,13 @@ with tab1:
 - **is_end**：列の端（1=端、0=端以外）
 
 - **final_score**：最終スコア（朝イチ優先度の結論）
-- 島マスタあり：島/並び/端 + 台単体 + 末尾 + 台番帯 を合成（重みはサイドバー）
-- 島マスタなし：台単体 + 末尾 + 台番帯 を合成
+- 島マスタあり：島/並び/端 + 台単体 を合成（重みはサイドバー）
+- 島マスタなし：台単体のみ（島/並び/端は 0 として扱う）
 
 - **unit_score**：その台“単体”の強さ（良台率＋信頼度）
 - **island_score**：その島が強いか（島全体の良台率）
 - **run_score**：同じ列(side)で両隣(pos±1)が強いか（並び）
 - **end_bonus**：端ボーナス（端なら1.0）
-
-- **tail / tail_score**：末尾（unit_number%10）とその強さ
 
 - **good_rate_weighted(%)**：直近重視の良台率（新しい日ほど重く評価）
 - **good_rate_simple(%)**：単純な良台率（期間を均等に扱う）
@@ -853,3 +1062,164 @@ with tab2:
         st.markdown("#### 追記後プレビュー（末尾5行）")
         preview_df = pd.read_csv(io.BytesIO(out_bytes))
         st.dataframe(preview_df.tail(5), use_container_width=True, hide_index=True)
+
+with tab3:
+    st.subheader("③ バックテスト（ツールの精度検証：上位Nの良台率 / lift / Hit@N）")
+    st.caption("※ その日を予測する際、学習には前日までのデータのみ使用（リーク防止）。良台判定は機種別RECOMMENDED（無い機種はサイドバー値）を使用。")
+
+    if df_all_shared.empty:
+        st.info("まずは『共通：過去データアップロード』に統合データを投入してください。")
+        st.stop()
+
+    df_tmp = df_all_shared.copy()
+    df_tmp["date"] = pd.to_datetime(df_tmp["date"], errors="coerce").dt.date
+    df_tmp = df_tmp[df_tmp["date"].notna()].copy()
+    df_tmp = df_tmp[df_tmp["shop"] == shop].copy()
+
+    if df_tmp.empty:
+        st.warning("この店名(shop)に一致するデータがありません。shop表記ゆれ（例：武蔵境/メッセ武蔵境）を確認してください。")
+        st.stop()
+
+    all_days = sorted(df_tmp["date"].unique().tolist())
+    min_day, max_day = all_days[0], all_days[-1]
+
+    colA, colB, colC = st.columns(3)
+    with colA:
+        eval_start = st.date_input("評価開始日", value=min_day, min_value=min_day, max_value=max_day, key="bt_eval_start")
+    with colB:
+        eval_end = st.date_input("評価終了日", value=max_day, min_value=min_day, max_value=max_day, key="bt_eval_end")
+    with colC:
+        topN_text = st.text_input("TopN（カンマ区切り）", value="5,10,20,30", key="bt_topn")
+    try:
+        top_ns = [int(x.strip()) for x in topN_text.split(",") if x.strip()]
+        top_ns = sorted(list(set([n for n in top_ns if n > 0])))
+    except Exception:
+        top_ns = [5, 10, 20, 30]
+
+    machines_available = sorted(df_tmp["machine"].dropna().unique().tolist())
+    target_mode = st.radio("対象機種", ["全機種", "選択"], horizontal=True, key="bt_machine_mode")
+    if target_mode == "全機種":
+        machines_bt = machines_available
+    else:
+        machines_bt = st.multiselect("対象機種を選択", options=machines_available, default=[machine] if machine in machines_available else machines_available[:1], key="bt_machines")
+        if not machines_bt:
+            st.warning("対象機種が未選択です。")
+            st.stop()
+
+    st.divider()
+    run_bt = st.button("バックテストを実行", type="primary", use_container_width=True)
+
+    if run_bt:
+        detail, overall_df, per_machine_df = backtest_precision_hit(
+            df_all=df_all_shared,
+            shop=shop,
+            machines=machines_bt,
+            lookback_days=int(lookback_days),
+            tau=int(tau),
+            min_unique_days=int(min_unique_days),
+            w_unit=float(w_unit),
+            w_island=float(w_island),
+            w_run=float(w_run),
+            w_end=float(w_end),
+            min_games_fallback=int(min_games),
+            max_rb_fallback=float(max_rb),
+            max_gassan_fallback=float(max_gassan),
+            top_ns=top_ns,
+            eval_start=eval_start,
+            eval_end=eval_end,
+        )
+
+        if detail is None:
+            st.error("バックテスト結果が生成できませんでした（評価期間が短い / サンプル不足 / データ欠損の可能性）。")
+            st.stop()
+
+        # 表示整形
+        overall_show = overall_df.copy()
+        for c in ["precision_topN","baseline_good_rate","lift_pt","hit_rate"]:
+            overall_show[c] = pd.to_numeric(overall_show[c], errors="coerce")
+        overall_show["precision_topN(%)"] = (overall_show["precision_topN"] * 100).round(1)
+        overall_show["baseline_good_rate(%)"] = (overall_show["baseline_good_rate"] * 100).round(1)
+        overall_show["lift_pt(%)"] = (overall_show["lift_pt"] * 100).round(1)
+        overall_show["hit_rate(%)"] = (overall_show["hit_rate"] * 100).round(1)
+
+        st.subheader("結果サマリ（全体）")
+        st.dataframe(
+            overall_show[["topN","eval_cases","precision_topN(%)","baseline_good_rate(%)","lift_pt(%)","hit_rate(%)"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # best N by lift
+        best = overall_show.sort_values("lift_pt", ascending=False).head(1)
+        if not best.empty:
+            bN = int(best["topN"].iloc[0])
+            st.success(f"liftが最大のTopN：**Top{bN}**（lift={best['lift_pt(%)'].iloc[0]}%pt / Hit={best['hit_rate(%)'].iloc[0]}%）")
+
+        st.subheader("結果サマリ（機種別）")
+        pm = per_machine_df.copy()
+        for c in ["precision_topN","baseline_good_rate","lift_pt","hit_rate"]:
+            pm[c] = pd.to_numeric(pm[c], errors="coerce")
+        pm["precision_topN(%)"] = (pm["precision_topN"] * 100).round(1)
+        pm["baseline_good_rate(%)"] = (pm["baseline_good_rate"] * 100).round(1)
+        pm["lift_pt(%)"] = (pm["lift_pt"] * 100).round(1)
+        pm["hit_rate(%)"] = (pm["hit_rate"] * 100).round(1)
+
+        st.dataframe(
+            pm[["machine","topN","eval_cases","precision_topN(%)","baseline_good_rate(%)","lift_pt(%)","hit_rate(%)"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.subheader("詳細（day × machine × topN）")
+        det = detail.copy()
+        det["precision_topN(%)"] = (pd.to_numeric(det["precision_topN"], errors="coerce") * 100).round(1)
+        det["baseline_good_rate(%)"] = (pd.to_numeric(det["baseline_good_rate"], errors="coerce") * 100).round(1)
+        det["lift_pt(%)"] = (pd.to_numeric(det["lift_pt"], errors="coerce") * 100).round(1)
+        st.dataframe(
+            det[["date","machine","topN","selected_n","good_in_topN","precision_topN(%)","baseline_good_rate(%)","lift_pt(%)","hit_at_N"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.divider()
+        st.subheader("バックテスト結果のダウンロード")
+        dl_zip = st.checkbox("詳細・サマリをzipでまとめてDL", value=True, key="bt_dl_zip")
+        if dl_zip:
+            mem = io.BytesIO()
+            with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+                z.writestr(f"{date_str}_bt_overall.csv", overall_df.to_csv(index=False).encode("utf-8-sig"))
+                z.writestr(f"{date_str}_bt_per_machine.csv", per_machine_df.to_csv(index=False).encode("utf-8-sig"))
+                z.writestr(f"{date_str}_bt_detail.csv", detail.to_csv(index=False).encode("utf-8-sig"))
+            st.download_button(
+                "バックテスト結果（zip）をダウンロード",
+                data=mem.getvalue(),
+                file_name=f"{date_str}_backtest_results.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key="bt_dl_zip_btn"
+            )
+        else:
+            st.download_button(
+                "overallをCSVでDL",
+                data=overall_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{date_str}_bt_overall.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="bt_dl_overall"
+            )
+            st.download_button(
+                "per_machineをCSVでDL",
+                data=per_machine_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{date_str}_bt_per_machine.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="bt_dl_pm"
+            )
+            st.download_button(
+                "detailをCSVでDL",
+                data=detail.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{date_str}_bt_detail.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="bt_dl_detail"
+            )
