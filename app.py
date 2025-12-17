@@ -93,38 +93,119 @@ def compute_rates_if_needed(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def load_many_csvs(files) -> pd.DataFrame:
+# ========= 統合用：ファイル名から date / machine を推定 =========
+def parse_date_machine_from_filename(filename: str):
+    """
+    例：
+      2025-12-16_マイジャグラーV_original.csv
+      2025-12-16_08-32-45_マイジャグラーV_original.csv
+    """
+    if not filename:
+        return (None, None)
+    base = str(filename).split("/")[-1]
+
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})(?:_\d{2}-\d{2}-\d{2})?_(.+?)(?:_original)?\.csv$", base)
+    if not m:
+        return (None, None)
+
+    d = pd.to_datetime(m.group(1), errors="coerce")
+    date_hint = d.date() if pd.notna(d) else None
+    machine_hint = m.group(2)
+    return (date_hint, machine_hint)
+
+def fill_missing_meta(df: pd.DataFrame, date_hint, shop_hint, machine_hint) -> pd.DataFrame:
+    """date/shop/machine が欠損なら補完（行単位で欠損だけ埋める）"""
+    out = df.copy()
+
+    # date
+    if "date" not in out.columns:
+        out["date"] = pd.NaT
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    if date_hint is not None:
+        out.loc[out["date"].isna(), "date"] = pd.to_datetime(date_hint)
+
+    # shop
+    if "shop" not in out.columns:
+        out["shop"] = pd.NA
+    if shop_hint:
+        out.loc[
+            out["shop"].isna()
+            | (out["shop"].astype(str).str.strip() == "")
+            | (out["shop"].astype(str) == "nan"),
+            "shop"
+        ] = shop_hint
+
+    # machine
+    if "machine" not in out.columns:
+        out["machine"] = pd.NA
+    if machine_hint:
+        out.loc[
+            out["machine"].isna()
+            | (out["machine"].astype(str).str.strip() == "")
+            | (out["machine"].astype(str) == "nan"),
+            "machine"
+        ] = machine_hint
+
+    return out
+
+def load_many_csvs(files, default_shop: str, default_date: date | None = None, default_machine: str | None = None) -> pd.DataFrame:
     dfs = []
     for f in files:
+        date_hint, machine_hint = parse_date_machine_from_filename(getattr(f, "name", ""))
+
         df = pd.read_csv(f)
         df = normalize_columns(df)
         df = compute_rates_if_needed(df)
+
         for c in HEADER:
             if c not in df.columns:
                 df[c] = np.nan
         df = df[HEADER].copy()
+
+        df = fill_missing_meta(
+            df,
+            date_hint=date_hint or default_date,
+            shop_hint=default_shop,
+            machine_hint=machine_hint or default_machine,
+        )
+
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
         dfs.append(df)
+
     if not dfs:
         return pd.DataFrame(columns=HEADER)
     return pd.concat(dfs, ignore_index=True)
 
-def load_zip_of_csv(zip_bytes: bytes) -> pd.DataFrame:
+def load_zip_of_csv(zip_bytes: bytes, default_shop: str, default_date: date | None = None, default_machine: str | None = None) -> pd.DataFrame:
     dfs = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         for name in z.namelist():
             if not name.lower().endswith(".csv"):
                 continue
+
+            date_hint, machine_hint = parse_date_machine_from_filename(name)
+
             with z.open(name) as fp:
                 df = pd.read_csv(fp)
+
             df = normalize_columns(df)
             df = compute_rates_if_needed(df)
+
             for c in HEADER:
                 if c not in df.columns:
                     df[c] = np.nan
             df = df[HEADER].copy()
+
+            df = fill_missing_meta(
+                df,
+                date_hint=date_hint or default_date,
+                shop_hint=default_shop,
+                machine_hint=machine_hint or default_machine,
+            )
+
             df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
             dfs.append(df)
+
     if not dfs:
         return pd.DataFrame(columns=HEADER)
     return pd.concat(dfs, ignore_index=True)
@@ -431,8 +512,8 @@ with st.sidebar:
             "machine",
             MACHINE_PRESETS,
             index=0,
-            on_change=lambda: apply_recommended(st.session_state["machine_select"]),
             key="machine_select",
+            on_change=lambda: apply_recommended(st.session_state["machine_select"]),
         )
         machine = st.session_state["machine_select"]
     else:
@@ -460,7 +541,6 @@ with st.sidebar:
 
     w_unit = max(0.0, 1.0 - (w_island + w_run + w_end))
     st.caption(f"台単体の重み（自動の目安）: {w_unit:.2f}  ※ 合計が1を超えても内部で正規化します")
-
 
     st.divider()
     st.header("良台日判定（スライダー）")
@@ -492,9 +572,11 @@ with st.sidebar:
     min_unique_days = st.number_input("最小サンプル日数（稼働日数）", 1, 60, 3, 1)
     top_n = st.number_input("上位N件表示", 1, 200, 30, 1)
 
-# --------- 共通：過去データの投入 ---------
+# --------- 共通：過去データの投入（＋統合DL機能） ---------
 def upload_past_data_ui():
     st.caption("複数CSV（original.csv）または zip（CSVをまとめたもの）をアップロードしてください。")
+    st.caption("※ date/shop/machine がCSV内に無い場合：ファイル名（YYYY-MM-DD_機種...）→無ければサイドバー値で補完します。")
+
     colA, colB = st.columns(2)
     with colA:
         past_files = st.file_uploader(
@@ -515,15 +597,51 @@ def upload_past_data_ui():
         st.info("ここに過去データを入れると、店×機種で候補台をランキングします。")
         return pd.DataFrame(columns=HEADER)
 
+    # サイドバー値（補完用）
+    default_shop = shop
+    default_date = d
+    default_machine = machine
+
     df_all = pd.DataFrame(columns=HEADER)
     if past_files:
-        df_all = pd.concat([df_all, load_many_csvs(past_files)], ignore_index=True)
+        df_all = pd.concat(
+            [df_all, load_many_csvs(past_files, default_shop=default_shop, default_date=default_date, default_machine=default_machine)],
+            ignore_index=True
+        )
     if past_zip is not None:
-        df_all = pd.concat([df_all, load_zip_of_csv(past_zip.getvalue())], ignore_index=True)
+        df_all = pd.concat(
+            [df_all, load_zip_of_csv(past_zip.getvalue(), default_shop=default_shop, default_date=default_date, default_machine=default_machine)],
+            ignore_index=True
+        )
 
     if df_all.empty:
         st.error("CSVが読み込めませんでした（中身が空/形式違いの可能性）。")
         return pd.DataFrame(columns=HEADER)
+
+    # 統合時の重複除去
+    do_dedup = st.checkbox(
+        "統合時に重複行を除去（date+shop+machine+unit_number が同一なら最後の行を採用）",
+        value=True,
+        key="dedup_unified"
+    )
+    if do_dedup:
+        df_all = df_all.drop_duplicates(subset=["date","shop","machine","unit_number"], keep="last").copy()
+
+    # ---- ファイル統合機能 ----
+    st.subheader("0) ファイル統合（analysis用 unified.csv を作成）")
+    st.write(f"統合結果：**{len(df_all)} 行**（列：{len(df_all.columns)}）")
+
+    st.download_button(
+        "統合CSV（unified.csv）をダウンロード",
+        data=to_csv_bytes(df_all),
+        file_name=f"{date_str}_unified.csv",
+        mime="text/csv",
+        key="dl_unified_csv"
+    )
+
+    with st.expander("統合プレビュー（先頭/末尾）", expanded=False):
+        st.dataframe(df_all.head(20), use_container_width=True, hide_index=True)
+        st.dataframe(df_all.tail(20), use_container_width=True, hide_index=True)
 
     return df_all
 
