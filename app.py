@@ -11,7 +11,9 @@ from zoneinfo import ZoneInfo
 HEADER = [
     "date","shop","machine",
     "unit_number","start_games","total_start","bb_count","rb_count","art_count","max_medals",
-    "bb_rate","rb_rate","art_rate","gassan_rate","prev_day_end"
+    "bb_rate","rb_rate","art_rate","gassan_rate","prev_day_end",
+    # ---- date context (NEW) ----
+    "dow_num","dow","is_weekend","special_flag","special_name"
 ]
 
 SHOP_PRESETS = ["武蔵境", "吉祥寺", "三鷹", "国分寺", "新宿", "渋谷"]
@@ -38,6 +40,72 @@ RECOMMENDED = {
     "ネオアイムジャグラーEX":      {"min_games": 2500, "max_rb": 320.0, "max_gassan": 190.0},
     "ウルトラミラクルジャグラー": {"min_games": 2800, "max_rb": 300.0, "max_gassan": 185.0},
 }
+
+# ========= Date Context (NEW) =========
+DOW_LABEL = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
+SPECIAL_COLS = ["date", "special_flag", "special_name"]
+
+def load_special_days(uploaded_file) -> pd.DataFrame:
+    """
+    special_days.csv を読む
+    必須列: date
+    任意列: special_flag (0/1), special_name (文字)
+    """
+    df = pd.read_csv(uploaded_file)
+    if "date" not in df.columns:
+        raise ValueError("特定日マスタには date 列が必要です（YYYY-MM-DD）")
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df = df.dropna(subset=["date"]).copy()
+
+    if "special_flag" not in df.columns:
+        df["special_flag"] = 1
+    df["special_flag"] = pd.to_numeric(df["special_flag"], errors="coerce").fillna(1).astype(int).clip(0, 1)
+
+    if "special_name" not in df.columns:
+        df["special_name"] = ""
+    df["special_name"] = df["special_name"].astype(str).fillna("").str.strip()
+
+    df = df.sort_values("date").drop_duplicates("date", keep="last")
+    return df[SPECIAL_COLS].copy()
+
+def add_date_context(df: pd.DataFrame, special_days: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    dfに曜日などを付与する。既存列があっても上書きして最新化する。
+    special_days: ["date","special_flag","special_name"]
+    """
+    out = df.copy()
+    out["date"] = pd.to_datetime(out.get("date", pd.NaT), errors="coerce")
+    out["date"] = out["date"].dt.date
+
+    out["dow_num"] = pd.to_datetime(out["date"], errors="coerce").dt.weekday
+    out["dow"] = out["dow_num"].map(DOW_LABEL)
+    out["is_weekend"] = out["dow_num"].isin([5, 6]).astype(int)
+
+    out["special_flag"] = 0
+    out["special_name"] = ""
+
+    if special_days is not None and not special_days.empty:
+        sd = special_days.copy()
+        sd["date"] = pd.to_datetime(sd["date"], errors="coerce").dt.date
+        sd = sd.dropna(subset=["date"]).drop_duplicates("date", keep="last")
+        sd["special_flag"] = pd.to_numeric(sd["special_flag"], errors="coerce").fillna(1).astype(int).clip(0, 1)
+        sd["special_name"] = sd["special_name"].astype(str).fillna("").str.strip()
+
+        out = out.merge(sd, on="date", how="left", suffixes=("", "_m"))
+        out["special_flag"] = out["special_flag_m"].fillna(out["special_flag"]).astype(int)
+        out["special_name"] = out["special_name_m"].fillna(out["special_name"]).astype(str)
+        out = out.drop(columns=["special_flag_m", "special_name_m"], errors="ignore")
+
+    return out
+
+def special_days_template_bytes() -> bytes:
+    tmp = pd.DataFrame([
+        {"date":"2025-12-07", "special_flag":1, "special_name":"例：イベント/取材/周年"},
+        {"date":"2025-12-08", "special_flag":1, "special_name":"例：ゾロ目"},
+    ])
+    return tmp.to_csv(index=False).encode("utf-8-sig")
 
 # ========= Helpers =========
 def parse_rate_token(tok: str) -> float:
@@ -160,7 +228,6 @@ def load_many_csvs(files, default_shop: str, default_date: date | None = None, d
         for c in HEADER:
             if c not in df.columns:
                 df[c] = np.nan
-        df = df[HEADER].copy()
 
         df = fill_missing_meta(
             df,
@@ -170,6 +237,7 @@ def load_many_csvs(files, default_shop: str, default_date: date | None = None, d
         )
 
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+        df = df[HEADER].copy()
         dfs.append(df)
 
     if not dfs:
@@ -194,7 +262,6 @@ def load_zip_of_csv(zip_bytes: bytes, default_shop: str, default_date: date | No
             for c in HEADER:
                 if c not in df.columns:
                     df[c] = np.nan
-            df = df[HEADER].copy()
 
             df = fill_missing_meta(
                 df,
@@ -204,6 +271,7 @@ def load_zip_of_csv(zip_bytes: bytes, default_shop: str, default_date: date | No
             )
 
             df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+            df = df[HEADER].copy()
             dfs.append(df)
 
     if not dfs:
@@ -259,7 +327,6 @@ def validate_island_master(dfm: pd.DataFrame) -> list[str]:
     if (~dfm["is_end"].isin([0,1])).any():
         errs.append("is_end は 0/1 のみ対応です（不正値あり）")
 
-    # pos連番 + is_end
     dfm2 = dfm.dropna(subset=["pos"]).copy()
     for (island, side), g in dfm2.groupby(["island_id","side"]):
         poss = sorted(g["pos"].astype(int).tolist())
@@ -744,6 +811,26 @@ def upload_past_data_ui():
     st.caption("複数CSV（original.csv）または zip（CSVをまとめたもの）をアップロードしてください。")
     st.caption("※ date/shop/machine がCSV内に無い場合：ファイル名（YYYY-MM-DD_機種...）→無ければサイドバー値で補完します。")
 
+    st.subheader("補完情報（日付コンテキスト：曜日/週末/特定日）")
+    special_file = st.file_uploader("特定日マスタ（任意：special_days.csv）", type=["csv"], key="special_days_csv_morning")
+    st.download_button(
+        "特定日マスタのテンプレCSVをダウンロード",
+        data=special_days_template_bytes(),
+        file_name="special_days_template.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="dl_special_template_morning"
+    )
+    special_df = None
+    if special_file is not None:
+        try:
+            special_df = load_special_days(special_file)
+            st.success(f"特定日マスタ読込OK：{len(special_df)}日")
+            st.dataframe(special_df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"特定日マスタの読み込みに失敗しました: {e}")
+            st.stop()
+
     colA, colB = st.columns(2)
     with colA:
         past_files = st.file_uploader(
@@ -784,6 +871,9 @@ def upload_past_data_ui():
         st.error("CSVが読み込めませんでした（中身が空/形式違いの可能性）。")
         return pd.DataFrame(columns=HEADER)
 
+    # ★日付コンテキスト付与（NEW）
+    df_all = add_date_context(df_all, special_df)
+
     do_dedup = st.checkbox(
         "統合時に重複行を除去（date+shop+machine+unit_number が同一なら最後の行を採用）",
         value=True,
@@ -797,7 +887,7 @@ def upload_past_data_ui():
 
     st.download_button(
         "統合CSV（unified.csv）をダウンロード",
-        data=to_csv_bytes(df_all),
+        data=to_csv_bytes(df_all[HEADER].copy()),
         file_name=f"{date_str}_unified.csv",
         mime="text/csv",
         key="dl_unified_csv"
@@ -807,7 +897,7 @@ def upload_past_data_ui():
         st.dataframe(df_all.head(20), use_container_width=True, hide_index=True)
         st.dataframe(df_all.tail(20), use_container_width=True, hide_index=True)
 
-    return df_all
+    return df_all[HEADER].copy()
 
 # ========= Main UI =========
 st.divider()
@@ -996,9 +1086,6 @@ with tab3:
     st.subheader("③ バックテスト（ツール精度検証：上位Nの良台率 / lift / Hit@N）")
     st.caption("※ その日を予測する際、学習には前日までのデータのみ使用（リーク防止）。良台判定は機種別RECOMMENDED（無い機種はサイドバー値）を使用。")
 
-    # -----------------------------
-    # 0) 結果保持（session_state）
-    # -----------------------------
     if "bt_detail" not in st.session_state:
         st.session_state["bt_detail"] = None
         st.session_state["bt_overall"] = None
@@ -1006,7 +1093,6 @@ with tab3:
         st.session_state["bt_sig"] = None
 
     def _make_bt_signature():
-        """計算条件の署名（これが変わったら再実行推奨）"""
         try:
             top_ns_sig = tuple(int(x) for x in top_ns)
         except Exception:
@@ -1025,7 +1111,6 @@ with tab3:
             int(min_games), float(max_rb), float(max_gassan),
         )
 
-    # 指標の説明（ヘルプ）
     with st.expander("指標の説明（クリックで開く）", expanded=False):
         st.markdown("""
 ### このバックテストがやっていること
@@ -1038,25 +1123,19 @@ with tab3:
 
 ### 各指標の意味
 - **topN**：ランキング上位から「何台を見るか」（Top10なら上位10台）
-- **selected_n**：その評価ケースで実際にTopNとして扱えた台数（通常N。候補不足でN未満になることがあります）
+- **selected_n**：その評価ケースで実際にTopNとして扱えた台数
 - **good_in_topN**：TopNの中に「良台（当たり）」が何台あったか
 - **precision_topN**：TopNの良台率  `good_in_topN / selected_n`
 - **baseline_good_rate**：その日その機種の全体良台率（店の地合い） `good_all / all_units_n`
 - **lift_pt**：TopNが平均よりどれだけ有利か（ポイント差） `precision_topN - baseline_good_rate`
 - **hit_at_N**：TopNの中に当たりが1台でもあれば1、なければ0
-- **hit_rate**：hit_at_Nの平均（実戦向き）
-
-### 実戦的に何を見るべき？
-- **lift_pt**：ツールを使う価値（平均より当たりを寄せているか）
-- **hit_rate**：朝イチで“とりあえず当たり候補がある”確率
-- **precision_topN**：当たりの濃さ（効率よく当たりに触れたいなら重要）
+- **hit_rate**：hit_at_Nの平均
 """)
 
     if df_all_shared.empty:
         st.info("まずは『共通：過去データアップロード』に統合データを投入してください。")
         st.stop()
 
-    # shopフィルタ（存在チェック）
     df_tmp = df_all_shared.copy()
     df_tmp["date"] = pd.to_datetime(df_tmp["date"], errors="coerce").dt.date
     df_tmp = df_tmp[df_tmp["date"].notna()].copy()
@@ -1066,13 +1145,9 @@ with tab3:
         st.warning("この店名(shop)に一致するデータがありません。shop表記ゆれ（例：武蔵境/メッセ武蔵境）を確認してください。")
         st.stop()
 
-    # 評価可能な日付範囲
     all_days = sorted(df_tmp["date"].unique().tolist())
     min_day, max_day = all_days[0], all_days[-1]
 
-    # -----------------------------
-    # 1) 計算条件（ここを変えると再実行推奨）
-    # -----------------------------
     colA, colB, colC = st.columns(3)
     with colA:
         eval_start = st.date_input("評価開始日", value=min_day, min_value=min_day, max_value=max_day, key="bt_eval_start")
@@ -1104,7 +1179,6 @@ with tab3:
 
     st.divider()
 
-    # 実行 / クリア
     c1, c2 = st.columns([3, 1])
     with c1:
         run_bt = st.button("バックテストを実行", type="primary", use_container_width=True)
@@ -1118,7 +1192,6 @@ with tab3:
         st.session_state["bt_sig"] = None
         st.rerun()
 
-    # 実行時に計算して保存
     if run_bt:
         detail, overall_df, per_machine_df = backtest_precision_hit(
             df_all=df_all_shared,
@@ -1148,7 +1221,6 @@ with tab3:
         st.session_state["bt_per_machine"] = per_machine_df
         st.session_state["bt_sig"] = _make_bt_signature()
 
-    # 保存済み結果を読む（←ここがポイント：UI操作でrerunしても残る）
     detail = st.session_state["bt_detail"]
     overall_df = st.session_state["bt_overall"]
     per_machine_df = st.session_state["bt_per_machine"]
@@ -1157,14 +1229,10 @@ with tab3:
         st.info("まだバックテストが未実行です。上の『バックテストを実行』を押してください。")
         st.stop()
 
-    # 条件変更検知：結果が「前回条件のまま」なら警告だけ出す（表示は消さない）
     cur_sig = _make_bt_signature()
     if st.session_state["bt_sig"] is not None and st.session_state["bt_sig"] != cur_sig:
         st.warning("⚠️ 計算条件が変更されています。表示中の結果は『前回実行時の条件』のものです。必要なら再度『バックテストを実行』してください。")
 
-    # -----------------------------
-    # 2) サマリ表示（全体）
-    # -----------------------------
     overall_show = overall_df.copy()
     for c in ["precision_topN", "baseline_good_rate", "lift_pt", "hit_rate"]:
         overall_show[c] = pd.to_numeric(overall_show[c], errors="coerce")
@@ -1185,9 +1253,6 @@ with tab3:
         bN = int(best["topN"].iloc[0])
         st.success(f"liftが最大のTopN：**Top{bN}**（lift={best['lift_pt(%pt)'].iloc[0]}%pt / Hit={best['hit_rate(%)'].iloc[0]}%）")
 
-    # -----------------------------
-    # 3) サマリ表示（機種別）
-    # -----------------------------
     st.subheader("結果サマリ（機種別）")
     pm = per_machine_df.copy()
     for c in ["precision_topN", "baseline_good_rate", "lift_pt", "hit_rate"]:
@@ -1203,9 +1268,6 @@ with tab3:
         hide_index=True
     )
 
-    # -----------------------------
-    # 4) 詳細（day × machine × topN）
-    # -----------------------------
     st.subheader("詳細（day × machine × topN）")
     det = detail.copy()
     det["date"] = pd.to_datetime(det["date"], errors="coerce").dt.date
@@ -1219,10 +1281,6 @@ with tab3:
         hide_index=True
     )
 
-    # ============================================================
-    # 5) 外れ日ランキング（liftが低い日 TOP）
-    #   ※ここは「表示用UI」なので、触っても結果は消えません
-    # ============================================================
     st.divider()
     st.subheader("外れ日分析（特定の日に外れやすいかを見る）")
 
@@ -1306,9 +1364,6 @@ with tab3:
             key="bt_dl_bad_days"
         )
 
-    # ============================================================
-    # 6) 日別ヒートマップ（date × topN で lift）
-    # ============================================================
     st.divider()
     st.subheader("日別ヒートマップ（date × topN の lift）")
     st.caption("lift(%pt)=（ツール上位の良台率）−（全体良台率）。緑ほど良く、赤ほど悪い日です。")
@@ -1359,9 +1414,6 @@ with tab3:
         key="bt_dl_heatmap"
     )
 
-    # -----------------------------
-    # 7) まとめてDL
-    # -----------------------------
     st.divider()
     st.subheader("バックテスト結果のダウンロード")
     dl_zip = st.checkbox("詳細・サマリをzipでまとめてDL", value=True, key="bt_dl_zip")
