@@ -753,6 +753,7 @@ def backtest_precision_hit(
 PLAYLOG_HEADER = [
     "created_at",
     "date", "weekday", "shop", "machine", "unit_number",
+
     "tool_phase",        # morning / evening / none
     "tool_rank",         # 朝イチrank or 夕方候補順位
     "tool_score",        # 朝イチ final_score or 夕方 score
@@ -760,11 +761,73 @@ PLAYLOG_HEADER = [
     "tool_logic",        # morning_rank / evening_filter など
     "tool_version",
     "select_reason",
+
+    # ★開始スナップショット（候補表から自動で入る）
+    "start_total_start",
+    "start_bb_count",
+    "start_rb_count",
+    "start_rb_rate",
+    "start_gassan_rate",
+
+    # ★終了スナップショット（実戦後に手入力）
+    "end_total_start",
+    "end_bb_count",
+    "end_rb_count",
+    "end_rb_rate",
+    "end_gassan_rate",
+
+    # ★結果ラベル（分析が楽になる）
+    "result_outcome",    # 勝ち/負け/トントン/不明
+    "result_hit",        # 当たり/外れ/不明
+
+    # 実戦情報
     "start_time", "end_time",
     "invest_medals", "payout_medals", "profit_medals",
     "play_games",
     "stop_reason", "memo"
 ]
+
+def _num(x):
+    try:
+        if pd.isna(x): 
+            return np.nan
+        return float(str(x).replace(",", ""))
+    except Exception:
+        return np.nan
+
+def prefill_log_from_candidate(row: dict, phase: str, rank: int, score: float,thr_min: float, thr_rb: float, thr_gs: float,tool_logic: str):
+    # メタ
+    st.session_state["log_date"] = str(row.get("date", date_str))
+    st.session_state["log_shop"] = str(row.get("shop", shop))
+    st.session_state["log_machine"] = str(row.get("machine", machine))
+    st.session_state["log_unit"] = int(_num(row.get("unit_number", 0)) or 0)
+
+    # tool情報
+    st.session_state["log_phase"] = phase
+    st.session_state["log_rank"] = int(rank)
+    st.session_state["log_score"] = float(_num(score) or 0.0)
+
+    st.session_state["log_thr_min"] = float(_num(thr_min) or 0)
+    st.session_state["log_thr_rb"] = float(_num(thr_rb) or 0)
+    st.session_state["log_thr_gs"] = float(_num(thr_gs) or 0)
+
+    # 開始スナップショット（夕方候補表にはある）
+    st.session_state["log_start_total"] = float(_num(row.get("total_start", np.nan)) or 0)
+    st.session_state["log_start_bb"] = float(_num(row.get("bb_count", np.nan)) or 0)
+    st.session_state["log_start_rb"] = float(_num(row.get("rb_count", np.nan)) or 0)
+    st.session_state["log_start_rb_rate"] = float(_num(row.get("rb_rate", np.nan)) or 0)
+    st.session_state["log_start_gassan_rate"] = float(_num(row.get("gassan_rate", np.nan)) or 0)
+
+    # 終了側は“空”でOK（入力の手間を減らすため）
+    for k in ["log_end_total", "log_end_bb", "log_end_rb", "log_end_rb_rate", "log_end_gassan_rate"]:
+        st.session_state.setdefault(k, "")
+
+    # ラベルも初期化
+    st.session_state.setdefault("log_outcome", "不明")
+    st.session_state.setdefault("log_hit", "不明")
+
+    st.toast("✅ 候補情報を実戦ログフォームへ反映しました（実戦ログタブを開いてください）")
+
 
 def append_row_to_uploaded_csv(uploaded_bytes: bytes, new_row: dict) -> bytes:
     try:
