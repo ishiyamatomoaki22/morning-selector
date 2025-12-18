@@ -1231,153 +1231,122 @@ with tab_evening_in:
         st.caption("次に「夕方：続行候補（判定）」タブで、この統一CSVをアップロードして判定できます。")
 
 # -------- 夕方：続行候補 --------
+# -------- 夕方：続行候補 --------
 with tab_evening_pick:
     st.subheader("夕方：続行候補（統一済みCSVをアップロードして判定）")
     st.caption("条件：total_start / rb_rate / gassan_rate +（任意）並びボーナス で候補抽出")
 
     island_master = st.session_state.get("island_master", None)
-    unified_file = st.file_uploader("統一済みCSV（unified.csv）をアップロード", type=["csv"], key="evening_tab2_unified")
 
-    # ★ ここが重要：未入力でも st.stop() しない（他タブを止めない）
-    if not unified_file:
-        st.info("このタブは未入力です。判定したい場合だけ統一CSVをアップロードしてください。")
+    unified_file = st.file_uploader(
+        "統一済みCSV（unified.csv）をアップロード",
+        type=["csv"],
+        key="evening_tab2_unified"
+    )
+
+    # ★ st.stop() を使わず、未入力ならこのタブだけ案内して終了（他タブは描画される）
+    if unified_file is None:
+        st.info("統一CSVが未指定です。ここは未入力でもOKです（他タブの実戦ログ・バックテストは使えます）。")
         df_last = st.session_state.get("last_evening_unified")
         if isinstance(df_last, pd.DataFrame) and not df_last.empty:
             with st.expander("直前に作成した統一データ（参考）", expanded=False):
                 st.dataframe(df_last.head(30), use_container_width=True, hide_index=True)
     else:
-        try:
-            df = read_csv_flexible(unified_file)
-            df = normalize_columns(df)
-            df = compute_rates_if_needed(df)
-            df = ensure_meta_columns(df, date_str, shop, machine)
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = add_weekday_column(df)
-            df = align_to_base_header(df)
-        except Exception as e:
-            st.error(f"統一CSVの読み込みに失敗しました: {e}")
-            df = None
+        # ---- 読み込み & 正規化 ----
+        df = read_csv_flexible(unified_file)
+        df = normalize_columns(df)
+        df = compute_rates_if_needed(df)
+        df = ensure_meta_columns(df, date_str, shop, machine)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = add_weekday_column(df)
+        df = align_to_base_header(df)
 
-        if df is not None:
-            if island_master is not None and not island_master.empty:
-                df2 = df.copy()
-                df2["unit_number"] = pd.to_numeric(df2["unit_number"], errors="coerce").astype("Int64")
-                df2 = df2.merge(island_master, on="unit_number", how="left")
-                df = df2
+        # 島情報の結合（任意）
+        if island_master is not None and not island_master.empty:
+            df2 = df.copy()
+            df2["unit_number"] = pd.to_numeric(df2["unit_number"], errors="coerce").astype("Int64")
+            df2 = df2.merge(island_master, on="unit_number", how="left")
+            df = df2
 
-            df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
-            df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
-            df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
+        df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
+        df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
+        df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
 
-            cand = df[
-                (df["total_start_num"] >= evening_min_games) &
-                (df["rb_rate_num"] <= evening_max_rb) &
-                (df["gassan_rate_num"] <= evening_max_gassan)
-            ].copy()
+        cand = df[
+            (df["total_start_num"] >= evening_min_games) &
+            (df["rb_rate_num"] <= evening_max_rb) &
+            (df["gassan_rate_num"] <= evening_max_gassan)
+        ].copy()
 
-            if cand.empty:
-                st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
-            else:
-                cand["pos_num"] = pd.to_numeric(cand.get("pos", np.nan), errors="coerce")
-                cand["run_bonus"] = 0
+        # 並びボーナス（当日候補内で隣接があれば加点）
+        cand["pos_num"] = pd.to_numeric(cand.get("pos", np.nan), errors="coerce")
+        cand["run_bonus"] = 0
 
-                if "island_id" in cand.columns and cand["island_id"].notna().any():
-                    key_cols = ["island_id", "side"]
-                    pos_map = (
-                        cand.dropna(subset=["pos_num"])
-                        .groupby(key_cols)["pos_num"]
-                        .apply(lambda s: set(s.astype(int)))
-                        .to_dict()
-                    )
+        if "island_id" in cand.columns and cand["island_id"].notna().any():
+            key_cols = ["island_id", "side"]
+            pos_map = (
+                cand.dropna(subset=["pos_num"])
+                .groupby(key_cols)["pos_num"]
+                .apply(lambda s: set(s.astype(int)))
+                .to_dict()
+            )
 
-                    def _run_bonus(row):
-                        if pd.isna(row["pos_num"]):
-                            return 0
-                        k = (row.get("island_id", None), row.get("side", None))
-                        if k not in pos_map:
-                            return 0
-                        p = int(row["pos_num"])
-                        s = pos_map[k]
-                        return 1 if ((p - 1 in s) or (p + 1 in s)) else 0
+            def _run_bonus(row):
+                if pd.isna(row["pos_num"]):
+                    return 0
+                k = (row.get("island_id", None), row.get("side", None))
+                if k not in pos_map:
+                    return 0
+                p = int(row["pos_num"])
+                s = pos_map[k]
+                return 1 if ((p - 1 in s) or (p + 1 in s)) else 0
 
-                    cand["run_bonus"] = cand.apply(_run_bonus, axis=1).astype(int)
+            cand["run_bonus"] = cand.apply(_run_bonus, axis=1).astype(int)
 
-                w_sum = max(float(ew_rb + ew_total + ew_gs), 1e-9)
-                w_rb_n = float(ew_rb / w_sum)
-                w_total_n = float(ew_total / w_sum)
-                w_gs_n = float(ew_gs / w_sum)
+        if cand.empty:
+            st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
+        else:
+            eps = 1e-9
+            rb = cand["rb_rate_num"].replace(0, np.nan)
+            gs = cand["gassan_rate_num"].replace(0, np.nan)
 
-                eps = 1e-9
-                rb = cand["rb_rate_num"].replace(0, np.nan)
-                gs = cand["gassan_rate_num"].replace(0, np.nan)
+            cand["score"] = (
+                (evening_max_rb / (rb + eps)) * 70 +
+                (cand["total_start_num"] / max(evening_min_games, 1)) * 20 +
+                (evening_max_gassan / (gs + eps)) * 10
+            )
+            cand["score"] = cand["score"] + (cand["run_bonus"] * 1.5)
+            cand["score"] = cand["score"].replace([np.inf, -np.inf], np.nan).fillna(0)
 
-                cand["score"] = (
-                    (evening_max_rb / (rb + eps)) * (100 * w_rb_n) +
-                    (cand["total_start_num"] / max(evening_min_games, 1)) * (100 * w_total_n) +
-                    (evening_max_gassan / (gs + eps)) * (100 * w_gs_n)
-                )
-                cand["score"] = cand["score"] + (cand["run_bonus"] * float(run_bonus_w))
-                cand["score"] = cand["score"].replace([np.inf, -np.inf], np.nan).fillna(0)
+            # 表示はRB優先＋同率なら回転数（従来通り）
+            cand = cand.sort_values(["rb_rate_num", "total_start_num"], ascending=[True, False]).copy()
+            cand["evening_rank"] = np.arange(1, len(cand) + 1)
 
-                sort_mode = st.radio(
-                    "並び順（おすすめ：スコア順）",
-                    ["スコア順（推奨）", "RB優先（従来）"],
-                    horizontal=True,
-                    key="evening_sort_mode"
-                )
-                if sort_mode == "スコア順（推奨）":
-                    cand = cand.sort_values(["score", "total_start_num"], ascending=[False, False]).copy()
-                else:
-                    cand = cand.sort_values(["rb_rate_num", "total_start_num"], ascending=[True, False]).copy()
+            show_cols = [
+                "evening_rank",
+                "date", "weekday", "shop", "machine",
+                "unit_number", "total_start", "bb_count", "rb_count",
+                "bb_rate", "rb_rate", "gassan_rate",
+                "run_bonus", "score"
+            ]
+            show_cols = [c for c in show_cols if c in cand.columns]
+            show = cand[show_cols].copy()
 
-                cand["evening_rank"] = np.arange(1, len(cand) + 1)
+            for c in ["bb_rate", "rb_rate", "gassan_rate", "score"]:
+                if c in show.columns:
+                    show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
 
-                show_cols = [
-                    "evening_rank",
-                    "date", "weekday", "shop", "machine",
-                    "unit_number", "total_start", "bb_count", "rb_count",
-                    "bb_rate", "rb_rate", "gassan_rate",
-                    "run_bonus", "score"
-                ]
-                show_cols = [c for c in show_cols if c in cand.columns]
-                show = cand[show_cols].copy()
+            st.dataframe(show.head(int(evening_top_n)), use_container_width=True, hide_index=True)
+            st.session_state["last_evening_candidates"] = cand
 
-                for c in ["bb_rate", "rb_rate", "gassan_rate", "score"]:
-                    if c in show.columns:
-                        show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
-
-                st.dataframe(show.head(int(evening_top_n)), use_container_width=True, hide_index=True)
-                st.session_state["last_evening_candidates"] = cand
-
-                st.divider()
-                st.subheader("候補→実戦ログへ反映（夕方）")
-                ranks_e = cand["evening_rank"].astype(int).tolist()
-                sel_e = st.selectbox("反映したいevening_rank", options=ranks_e[:min(200, len(ranks_e))], index=0, key="evening_prefill_rank")
-                if st.button("この候補を実戦ログフォームに反映", type="primary", use_container_width=True, key="btn_prefill_evening"):
-                    r = cand[cand["evening_rank"] == int(sel_e)].iloc[0].to_dict()
-                    prefill_log_from_candidate(
-                        row=r,
-                        phase="evening",
-                        rank=int(sel_e),
-                        score=float(r.get("score", 0.0)),
-                        thr_min=float(evening_min_games),
-                        thr_rb=float(evening_max_rb),
-                        thr_gs=float(evening_max_gassan),
-                        tool_logic="evening_filter",
-                        fallback_date_str=date_str,
-                        fallback_shop=shop,
-                        fallback_machine=machine,
-                        select_reason="ツール上位",
-                    )
-
-                filename = make_filename(machine, "evening_candidates", date_str)
-                st.download_button(
-                    "夕方候補台をCSVでダウンロード",
-                    data=to_csv_bytes(show),
-                    file_name=filename,
-                    mime="text/csv",
-                    key="evening_tab2_dl_candidates"
-                )
+            filename = make_filename(machine, "evening_candidates", date_str)
+            st.download_button(
+                "夕方候補台をCSVでダウンロード",
+                data=to_csv_bytes(show),
+                file_name=filename,
+                mime="text/csv",
+                key="evening_tab2_dl_candidates"
+            )
 
 # -------- 実戦ログ（統合） --------
 with tab_log:
