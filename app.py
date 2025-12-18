@@ -20,7 +20,7 @@ st.title("ジャグラー 統合セレクター（朝イチ / 夕方 / 統合ロ
 st.caption("共通データ統合 → 朝イチ候補（学習ランキング）/ 夕方続行候補（当日判定）→ 実戦ログ（統合）→ バックテスト")
 
 JST = ZoneInfo("Asia/Tokyo")
-TOOL_VERSION = "v2025-12-18.2"  # ← st.stop除去版
+TOOL_VERSION = "v2025-12-18.3"  # ← 外れ日分析（日毎TopN lift_pt表）復活 + 夕方重み反映
 
 # ============================================================
 # Config
@@ -1231,7 +1231,6 @@ with tab_evening_in:
         st.caption("次に「夕方：続行候補（判定）」タブで、この統一CSVをアップロードして判定できます。")
 
 # -------- 夕方：続行候補 --------
-# -------- 夕方：続行候補 --------
 with tab_evening_pick:
     st.subheader("夕方：続行候補（統一済みCSVをアップロードして判定）")
     st.caption("条件：total_start / rb_rate / gassan_rate +（任意）並びボーナス で候補抽出")
@@ -1244,7 +1243,6 @@ with tab_evening_pick:
         key="evening_tab2_unified"
     )
 
-    # ★ st.stop() を使わず、未入力ならこのタブだけ案内して終了（他タブは描画される）
     if unified_file is None:
         st.info("統一CSVが未指定です。ここは未入力でもOKです（他タブの実戦ログ・バックテストは使えます）。")
         df_last = st.session_state.get("last_evening_unified")
@@ -1252,7 +1250,6 @@ with tab_evening_pick:
             with st.expander("直前に作成した統一データ（参考）", expanded=False):
                 st.dataframe(df_last.head(30), use_container_width=True, hide_index=True)
     else:
-        # ---- 読み込み & 正規化 ----
         df = read_csv_flexible(unified_file)
         df = normalize_columns(df)
         df = compute_rates_if_needed(df)
@@ -1306,20 +1303,28 @@ with tab_evening_pick:
         if cand.empty:
             st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
         else:
+            # ====== ★強化：サイドバーの重みスライダーを score に反映 ======
             eps = 1e-9
             rb = cand["rb_rate_num"].replace(0, np.nan)
             gs = cand["gassan_rate_num"].replace(0, np.nan)
 
+            wsum = float(ew_rb + ew_total + ew_gs)
+            if wsum <= 0:
+                wsum = 1.0
+            wrb = float(ew_rb) / wsum
+            wto = float(ew_total) / wsum
+            wgs = float(ew_gs) / wsum
+
             cand["score"] = (
-                (evening_max_rb / (rb + eps)) * 70 +
-                (cand["total_start_num"] / max(evening_min_games, 1)) * 20 +
-                (evening_max_gassan / (gs + eps)) * 10
+                (evening_max_rb / (rb + eps)) * wrb +
+                (cand["total_start_num"] / max(evening_min_games, 1)) * wto +
+                (evening_max_gassan / (gs + eps)) * wgs
             )
-            cand["score"] = cand["score"] + (cand["run_bonus"] * 1.5)
+            cand["score"] = cand["score"] + (cand["run_bonus"] * float(run_bonus_w))
             cand["score"] = cand["score"].replace([np.inf, -np.inf], np.nan).fillna(0)
 
-            # 表示はRB優先＋同率なら回転数（従来通り）
-            cand = cand.sort_values(["rb_rate_num", "total_start_num"], ascending=[True, False]).copy()
+            # 表示は score 優先（強化）＋補助で RB/回転
+            cand = cand.sort_values(["score", "rb_rate_num", "total_start_num"], ascending=[False, True, False]).copy()
             cand["evening_rank"] = np.arange(1, len(cand) + 1)
 
             show_cols = [
@@ -1334,7 +1339,7 @@ with tab_evening_pick:
 
             for c in ["bb_rate", "rb_rate", "gassan_rate", "score"]:
                 if c in show.columns:
-                    show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
+                    show[c] = pd.to_numeric(show[c], errors="coerce").round(3 if c == "score" else 1)
 
             st.dataframe(show.head(int(evening_top_n)), use_container_width=True, hide_index=True)
             st.session_state["last_evening_candidates"] = cand
@@ -1709,4 +1714,63 @@ with tab_bt:
                     det[["date", "machine", "topN", "selected_n", "good_in_topN", "precision_topN(%)", "baseline_good_rate(%)", "lift_pt(%pt)", "hit_at_N"]],
                     use_container_width=True,
                     hide_index=True
+                )
+
+                # ============================================================
+                # ★復活：外れ日分析（日毎のTopN lift_pt 表）
+                # ============================================================
+                st.divider()
+                st.subheader("外れ日分析（日毎TopNの lift_pt ）")
+
+                topN_for_daily = st.selectbox(
+                    "外れ日ランキングに使う TopN",
+                    options=sorted(det["topN"].dropna().unique().tolist()),
+                    index=0,
+                    key="bt_daily_topn_pick"
+                )
+
+                daily = det.copy()
+                daily["lift_pt"] = pd.to_numeric(daily["lift_pt"], errors="coerce")
+                daily["precision_topN"] = pd.to_numeric(daily["precision_topN"], errors="coerce")
+                daily["baseline_good_rate"] = pd.to_numeric(daily["baseline_good_rate"], errors="coerce")
+                daily["hit_at_N"] = pd.to_numeric(daily["hit_at_N"], errors="coerce")
+
+                daily_agg = daily.groupby(["date","topN"], dropna=False).agg(
+                    cases=("machine", "nunique"),
+                    lift_mean=("lift_pt", "mean"),
+                    precision_mean=("precision_topN", "mean"),
+                    baseline_mean=("baseline_good_rate", "mean"),
+                    hit_rate=("hit_at_N", "mean"),
+                ).reset_index()
+
+                # 表（ピボット）：date × topN で lift_pt（%pt）
+                lift_pivot = daily_agg.pivot(index="date", columns="topN", values="lift_mean").sort_index()
+                lift_pivot_pctpt = (lift_pivot * 100).round(1)
+
+                st.caption("date × topN の平均lift（%pt）です。マイナスが強い日＝“外れ日”の傾向。")
+                st.dataframe(lift_pivot_pctpt, use_container_width=True)
+
+                # 外れ日ランキング（指定TopN）
+                rank_src = daily_agg[daily_agg["topN"] == int(topN_for_daily)].copy()
+                rank_src["lift_pt(%pt)"] = (rank_src["lift_mean"] * 100).round(1)
+                rank_src["precision(%)"] = (rank_src["precision_mean"] * 100).round(1)
+                rank_src["baseline(%)"] = (rank_src["baseline_mean"] * 100).round(1)
+                rank_src["hit_rate(%)"] = (rank_src["hit_rate"] * 100).round(1)
+
+                st.markdown(f"#### 外れ日ランキング（TopN={int(topN_for_daily)} / liftが低い順）")
+                st.dataframe(
+                    rank_src.sort_values("lift_mean", ascending=True)[
+                        ["date","cases","precision(%)","baseline(%)","lift_pt(%pt)","hit_rate(%)"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                # ダウンロード
+                st.download_button(
+                    "日毎lift表（pivot）をCSVでダウンロード",
+                    data=to_csv_bytes(lift_pivot_pctpt.reset_index()),
+                    file_name=make_filename(machine="backtest", suffix=f"daily_lift_pivot_topN", date_str=date_str),
+                    mime="text/csv",
+                    key="bt_daily_lift_dl"
                 )
