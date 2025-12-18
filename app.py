@@ -1,3 +1,11 @@
+# streamlit_app.py
+# 統合版：朝イチ候補 + 夕方続行判定 + 統合ログ + バックテスト
+# 方針：
+# ✅ UI・共通処理・ログ追記を一本化
+# ✅ 実戦ログを一本化（tool_phase/tool_rank/tool_score/閾値/ロジック情報を列で保持）
+# ❌ 朝イチロジック（学習ランキング）と夕方ロジック（当日フィルタ）は統一しない
+# ✅ ただし閾値・スコア・どのロジックで選んだかはログに残す（再現性・分析性UP）
+
 import io
 import re
 import zipfile
@@ -7,12 +15,24 @@ import streamlit as st
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-# ========= Config =========
-# ★ weekday を追加（統合時に date から自動生成）
-HEADER = [
-    "date","weekday","shop","machine",
-    "unit_number","start_games","total_start","bb_count","rb_count","art_count","max_medals",
-    "bb_rate","rb_rate","art_rate","gassan_rate","prev_day_end"
+# ============================================================
+# App Meta
+# ============================================================
+st.set_page_config(page_title="ジャグラー統合セレクター", layout="wide")
+st.title("ジャグラー 統合セレクター（朝イチ / 夕方 / 統合ログ / バックテスト）")
+st.caption("共通データ統合 → 朝イチ候補（学習ランキング）/ 夕方続行候補（当日判定）→ 実戦ログ（統合）→ バックテスト")
+
+JST = ZoneInfo("Asia/Tokyo")
+TOOL_VERSION = "v2025-12-18"
+
+# ============================================================
+# Config
+# ============================================================
+# ★ 統合データのヘッダ（weekday込み）
+BASE_HEADER = [
+    "date", "weekday", "shop", "machine",
+    "unit_number", "start_games", "total_start", "bb_count", "rb_count", "art_count", "max_medals",
+    "bb_rate", "rb_rate", "art_rate", "gassan_rate", "prev_day_end"
 ]
 
 SHOP_PRESETS = ["武蔵境", "吉祥寺", "三鷹", "国分寺", "新宿", "渋谷"]
@@ -22,14 +42,8 @@ MACHINE_PRESETS = [
     "ネオアイムジャグラーEX", "ウルトラミラクルジャグラー"
 ]
 
-st.set_page_config(page_title="ジャグラー朝イチセレクター", layout="wide")
-st.title("ジャグラー 朝イチ台セレクター（過去データ集計 → 候補ランキング）")
-st.caption("過去の original.csv（複数日）をアップロード → 店×機種ごとに集計 → 朝イチ候補を順位付け（島マスタ対応）")
-
-JST = ZoneInfo("Asia/Tokyo")
-
-# ========= 朝イチ用おすすめ設定（勝率重視の目安） =========
-RECOMMENDED = {
+# 朝イチ用おすすめ（勝率寄りの目安）
+RECOMMENDED_MORNING = {
     "マイジャグラーV":            {"min_games": 2500, "max_rb": 280.0, "max_gassan": 175.0},
     "ゴーゴージャグラー3":        {"min_games": 2500, "max_rb": 290.0, "max_gassan": 180.0},
     "ハッピージャグラーVIII":     {"min_games": 2800, "max_rb": 270.0, "max_gassan": 170.0},
@@ -40,7 +54,32 @@ RECOMMENDED = {
     "ウルトラミラクルジャグラー": {"min_games": 2800, "max_rb": 300.0, "max_gassan": 185.0},
 }
 
-# ========= Helpers =========
+# 夕方用おすすめ（続行候補を厳しめに抽出する目安）
+RECOMMENDED_EVENING = {
+    "マイジャグラーV":            {"min_games": 3000, "max_rb": 270.0, "max_gassan": 180.0},
+    "ゴーゴージャグラー3":        {"min_games": 3000, "max_rb": 280.0, "max_gassan": 185.0},
+    "ハッピージャグラーVIII":     {"min_games": 3500, "max_rb": 260.0, "max_gassan": 175.0},
+    "ファンキージャグラー2KT":    {"min_games": 3000, "max_rb": 300.0, "max_gassan": 190.0},
+    "ミスタージャグラー":         {"min_games": 2800, "max_rb": 300.0, "max_gassan": 190.0},
+    "ジャグラーガールズSS":       {"min_games": 2500, "max_rb": 260.0, "max_gassan": 175.0},
+    "ネオアイムジャグラーEX":      {"min_games": 2500, "max_rb": 330.0, "max_gassan": 200.0},
+    "ウルトラミラクルジャグラー": {"min_games": 3500, "max_rb": 300.0, "max_gassan": 195.0},
+}
+
+# ============================================================
+# Helpers（共通）
+# ============================================================
+JP_WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
+
+def add_weekday_column(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "date" not in out.columns:
+        out["date"] = pd.NaT
+    dt = pd.to_datetime(out["date"], errors="coerce")
+    wd = dt.dt.dayofweek  # 0=Mon
+    out["weekday"] = wd.map(lambda x: JP_WEEKDAYS[int(x)] if pd.notna(x) else np.nan)
+    return out
+
 def parse_rate_token(tok: str) -> float:
     """ '1/186.3' -> 186.3 , '186.3' -> 186.3 """
     if pd.isna(tok):
@@ -57,6 +96,7 @@ def parse_rate_token(tok: str) -> float:
         return np.nan
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df.columns = df.columns.astype(str).str.strip()
     rename_map = {
         "台番": "unit_number", "台番号": "unit_number",
@@ -71,47 +111,194 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
 
 def compute_rates_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
     for c in ["unit_number","start_games","total_start","bb_count","rb_count","art_count","max_medals","prev_day_end"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ""), errors="coerce")
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c].astype(str).str.replace(",", ""), errors="coerce")
 
     for c in ["bb_rate","rb_rate","art_rate","gassan_rate"]:
-        if c not in df.columns:
-            df[c] = np.nan
+        if c not in out.columns:
+            out[c] = np.nan
 
-    df["bb_rate"] = df["bb_rate"].map(parse_rate_token)
-    df["rb_rate"] = df["rb_rate"].map(parse_rate_token)
-    df["art_rate"] = df["art_rate"].map(parse_rate_token)
-    df["gassan_rate"] = df["gassan_rate"].map(parse_rate_token)
+    out["bb_rate"] = out["bb_rate"].map(parse_rate_token)
+    out["rb_rate"] = out["rb_rate"].map(parse_rate_token)
+    out["art_rate"] = out["art_rate"].map(parse_rate_token)
+    out["gassan_rate"] = out["gassan_rate"].map(parse_rate_token)
 
-    if "total_start" in df.columns:
-        bb_mask = df["bb_rate"].isna() & df["bb_count"].gt(0)
-        rb_mask = df["rb_rate"].isna() & df["rb_count"].gt(0)
-        gs_mask = df["gassan_rate"].isna() & (df["bb_count"].add(df["rb_count"]).gt(0))
+    if "total_start" in out.columns:
+        bb_mask = out["bb_rate"].isna() & out.get("bb_count", pd.Series([0]*len(out))).gt(0)
+        rb_mask = out["rb_rate"].isna() & out.get("rb_count", pd.Series([0]*len(out))).gt(0)
+        gs_mask = out["gassan_rate"].isna() & (out.get("bb_count", 0).add(out.get("rb_count", 0)).gt(0))
 
-        df.loc[bb_mask, "bb_rate"] = df.loc[bb_mask, "total_start"] / df.loc[bb_mask, "bb_count"]
-        df.loc[rb_mask, "rb_rate"] = df.loc[rb_mask, "total_start"] / df.loc[rb_mask, "rb_count"]
-        df.loc[gs_mask, "gassan_rate"] = df.loc[gs_mask, "total_start"] / (df.loc[gs_mask, "bb_count"] + df.loc[gs_mask, "rb_count"])
+        if "bb_count" in out.columns:
+            out.loc[bb_mask, "bb_rate"] = out.loc[bb_mask, "total_start"] / out.loc[bb_mask, "bb_count"]
+        if "rb_count" in out.columns:
+            out.loc[rb_mask, "rb_rate"] = out.loc[rb_mask, "total_start"] / out.loc[rb_mask, "rb_count"]
+        if "bb_count" in out.columns and "rb_count" in out.columns:
+            out.loc[gs_mask, "gassan_rate"] = out.loc[gs_mask, "total_start"] / (out.loc[gs_mask, "bb_count"] + out.loc[gs_mask, "rb_count"])
 
-    return df
-
-# ========= ★追加：weekday 自動生成 =========
-JP_WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
-
-def add_weekday_column(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    date から weekday（'月'〜'日'）を自動生成。
-    既にweekdayがあっても、dateが取れている行は上書きして整合させます（統合時の品質優先）。
-    """
-    out = df.copy()
-    if "date" not in out.columns:
-        out["date"] = pd.NaT
-    dt = pd.to_datetime(out["date"], errors="coerce")
-    wd = dt.dt.dayofweek  # 0=Mon
-    out["weekday"] = wd.map(lambda x: JP_WEEKDAYS[int(x)] if pd.notna(x) else np.nan)
     return out
 
-# ========= 統合用：ファイル名から date / machine を推定 =========
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+def make_filename(machine: str, suffix: str, date_str: str) -> str:
+    time_part = datetime.now(JST).strftime("%H-%M-%S")
+    safe_machine = str(machine).replace(" ", "").replace("/", "_").replace("\\", "_").replace(":", "-")
+    return f"{date_str}_{time_part}_{safe_machine}_{suffix}.csv"
+
+# ============================================================
+# Island Master（共通）
+# ============================================================
+ISLAND_COLS = ["unit_number","island_id","side","pos","edge_type","is_end"]
+
+def load_island_master(uploaded_file) -> pd.DataFrame:
+    dfm = pd.read_csv(uploaded_file)
+    dfm = dfm.copy()
+    dfm.columns = dfm.columns.astype(str).str.strip()
+    missing = [c for c in ISLAND_COLS if c not in dfm.columns]
+    if missing:
+        raise ValueError(f"島マスタの列が不足しています: {missing}")
+
+    dfm["unit_number"] = pd.to_numeric(dfm["unit_number"], errors="coerce").astype("Int64")
+    dfm["pos"] = pd.to_numeric(dfm["pos"], errors="coerce").astype("Int64")
+    dfm["is_end"] = pd.to_numeric(dfm["is_end"], errors="coerce").fillna(0).astype(int)
+
+    dfm["island_id"] = dfm["island_id"].astype(str).str.strip()
+    dfm["side"] = dfm["side"].astype(str).str.strip().str.upper()
+    dfm["edge_type"] = dfm["edge_type"].astype(str).str.strip().str.lower()
+
+    return dfm[ISLAND_COLS].copy()
+
+def validate_island_master(dfm: pd.DataFrame) -> list[str]:
+    errs = []
+    if dfm["unit_number"].isna().any():
+        errs.append("unit_number に欠損があります（数値に変換できない行がある）")
+    if dfm["unit_number"].duplicated().any():
+        errs.append("unit_number が重複しています")
+    if dfm.duplicated(["island_id","side","pos"]).any():
+        errs.append("(island_id, side, pos) が重複しています")
+
+    ok_edge = {"wall","aisle","center"}
+    if (~dfm["edge_type"].isin(ok_edge)).any():
+        errs.append(f"edge_type は {sorted(list(ok_edge))} のみ対応です（不正値あり）")
+
+    ok_side = {"L","R","S"}
+    if (~dfm["side"].isin(ok_side)).any():
+        errs.append("side は L/R/S のみ対応です（不正値あり）")
+
+    if (~dfm["is_end"].isin([0,1])).any():
+        errs.append("is_end は 0/1 のみ対応です（不正値あり）")
+
+    dfm2 = dfm.dropna(subset=["pos"]).copy()
+    for (island, side), g in dfm2.groupby(["island_id","side"]):
+        poss = sorted(g["pos"].astype(int).tolist())
+        if not poss:
+            continue
+        exp = list(range(1, max(poss)+1))
+        if poss != exp:
+            errs.append(f"{island}-{side}: posが連番ではありません（欠番あり）")
+        maxpos = max(poss)
+        end_bad = g[((g["pos"]==1) | (g["pos"]==maxpos)) & (g["is_end"]!=1)]
+        if not end_bad.empty:
+            errs.append(f"{island}-{side}: 端(pos=1 or {maxpos})なのに is_end!=1 の行があります")
+    return errs
+
+def attach_island_info(df_all: pd.DataFrame, island_master: pd.DataFrame) -> pd.DataFrame:
+    out = df_all.copy()
+    out["unit_number"] = pd.to_numeric(out["unit_number"], errors="coerce").astype("Int64")
+    out = out.merge(island_master, on="unit_number", how="left")
+    return out
+
+# ============================================================
+# 夕方：入力→変換（12列生データ対応 & 文字コードフォールバック）
+# ============================================================
+def read_csv_flexible(file_like) -> pd.DataFrame:
+    last_err = None
+    for enc in ["utf-8-sig", "cp932", None]:
+        try:
+            if enc is None:
+                return pd.read_csv(file_like)
+            return pd.read_csv(file_like, encoding=enc)
+        except Exception as e:
+            last_err = e
+            try:
+                if hasattr(file_like, "seek"):
+                    file_like.seek(0)
+            except Exception:
+                pass
+    raise last_err
+
+def clean_to_12_parts(line: str):
+    """
+    先頭にアイコン等のゴミが混ざっても、数値/確率(1/xxx)だけ抽出して12列に整形する。
+    """
+    line = line.strip()
+    if not line:
+        return None
+    parts = re.split(r"\s+", line)
+
+    def is_data_token(tok: str) -> bool:
+        tok = tok.strip().replace(",", "")
+        return bool(re.match(r"^(?:\d+(?:\.\d+)?|1/\d+(?:\.\d+)?)$", tok))
+
+    data_parts = [p.replace(",", "") for p in parts if is_data_token(p)]
+    if len(data_parts) > 12:
+        data_parts = data_parts[-12:]
+    if len(data_parts) != 12:
+        return None
+    return data_parts
+
+def ensure_meta_columns(df: pd.DataFrame, date_str: str, shop: str, machine: str) -> pd.DataFrame:
+    out = df.copy()
+    if "date" not in out.columns:
+        out["date"] = date_str
+    if "shop" not in out.columns:
+        out["shop"] = shop
+    if "machine" not in out.columns:
+        out["machine"] = machine
+
+    out["date"] = out["date"].fillna(date_str)
+    out["shop"] = out["shop"].fillna(shop)
+    out["machine"] = out["machine"].fillna(machine)
+    return out
+
+def parse_raw12(text: str, date_str: str, shop: str, machine: str) -> pd.DataFrame:
+    """
+    12列：unit_number start_games total_start bb_count rb_count art_count max_medals
+         bb_rate rb_rate art_rate gassan_rate prev_day_end
+    """
+    rows = []
+    for line_no, line in enumerate((text or "").splitlines(), start=1):
+        parts12 = clean_to_12_parts(line)
+        if parts12 is None:
+            if line.strip() == "":
+                continue
+            raise ValueError(f"{line_no}行目：12列に整形できませんでした: {line}")
+
+        (unit_number, start_games, total_start, bb_count, rb_count, art_count,
+         max_medals, bb_rate, rb_rate, art_rate, gassan_rate, prev_day_end) = parts12
+
+        rows.append({
+            "date": date_str, "shop": shop, "machine": machine,
+            "unit_number": unit_number, "start_games": start_games, "total_start": total_start,
+            "bb_count": bb_count, "rb_count": rb_count, "art_count": art_count, "max_medals": max_medals,
+            "bb_rate": bb_rate, "rb_rate": rb_rate, "art_rate": art_rate, "gassan_rate": gassan_rate,
+            "prev_day_end": prev_day_end
+        })
+
+    df = pd.DataFrame(rows)
+    df = normalize_columns(df)
+    df = compute_rates_if_needed(df)
+    df = ensure_meta_columns(df, date_str, shop, machine)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = add_weekday_column(df)
+    return align_to_base_header(df)
+
+# ============================================================
+# ファイル統合（朝イチ/バックテスト用：original.csv 複数 or zip）
+# ============================================================
 def parse_date_machine_from_filename(filename: str):
     """
     例：
@@ -121,7 +308,6 @@ def parse_date_machine_from_filename(filename: str):
     if not filename:
         return (None, None)
     base = str(filename).split("/")[-1]
-
     m = re.match(r"^(\d{4}-\d{2}-\d{2})(?:_\d{2}-\d{2}-\d{2})?_(.+?)(?:_original)?\.csv$", base)
     if not m:
         return (None, None)
@@ -132,7 +318,6 @@ def parse_date_machine_from_filename(filename: str):
     return (date_hint, machine_hint)
 
 def fill_missing_meta(df: pd.DataFrame, date_hint, shop_hint, machine_hint) -> pd.DataFrame:
-    """date/shop/machine が欠損なら補完（行単位で欠損だけ埋める）"""
     out = df.copy()
 
     # date
@@ -166,6 +351,18 @@ def fill_missing_meta(df: pd.DataFrame, date_hint, shop_hint, machine_hint) -> p
 
     return out
 
+def align_to_base_header(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in BASE_HEADER:
+        if c not in out.columns:
+            out[c] = np.nan
+    out = out[BASE_HEADER].copy()
+    # dateを文字列/日付で混在させない（内部はdatetime → 最後にdate）
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = add_weekday_column(out)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date
+    return out
+
 def load_many_csvs(files, default_shop: str, default_date=None, default_machine: str | None = None) -> pd.DataFrame:
     dfs = []
     for f in files:
@@ -175,11 +372,6 @@ def load_many_csvs(files, default_shop: str, default_date=None, default_machine:
         df = normalize_columns(df)
         df = compute_rates_if_needed(df)
 
-        for c in HEADER:
-            if c not in df.columns:
-                df[c] = np.nan
-        df = df[HEADER].copy()
-
         df = fill_missing_meta(
             df,
             date_hint=date_hint or default_date,
@@ -187,15 +379,11 @@ def load_many_csvs(files, default_shop: str, default_date=None, default_machine:
             machine_hint=machine_hint or default_machine,
         )
 
-        # dateの確定 → weekday自動生成
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = add_weekday_column(df)
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-
+        df = align_to_base_header(df)
         dfs.append(df)
 
     if not dfs:
-        return pd.DataFrame(columns=HEADER)
+        return pd.DataFrame(columns=BASE_HEADER)
     return pd.concat(dfs, ignore_index=True)
 
 def load_zip_of_csv(zip_bytes: bytes, default_shop: str, default_date=None, default_machine: str | None = None) -> pd.DataFrame:
@@ -204,7 +392,6 @@ def load_zip_of_csv(zip_bytes: bytes, default_shop: str, default_date=None, defa
         for name in z.namelist():
             if not name.lower().endswith(".csv"):
                 continue
-
             date_hint, machine_hint = parse_date_machine_from_filename(name)
 
             with z.open(name) as fp:
@@ -213,130 +400,26 @@ def load_zip_of_csv(zip_bytes: bytes, default_shop: str, default_date=None, defa
             df = normalize_columns(df)
             df = compute_rates_if_needed(df)
 
-            for c in HEADER:
-                if c not in df.columns:
-                    df[c] = np.nan
-            df = df[HEADER].copy()
-
             df = fill_missing_meta(
                 df,
                 date_hint=date_hint or default_date,
                 shop_hint=default_shop,
                 machine_hint=machine_hint or default_machine,
             )
-
-            # dateの確定 → weekday自動生成
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = add_weekday_column(df)
-            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-
+            df = align_to_base_header(df)
             dfs.append(df)
 
     if not dfs:
-        return pd.DataFrame(columns=HEADER)
+        return pd.DataFrame(columns=BASE_HEADER)
     return pd.concat(dfs, ignore_index=True)
 
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
-
-def make_filename(machine: str, suffix: str, date_str: str) -> str:
-    time_part = datetime.now(JST).strftime("%H-%M-%S")
-    safe_machine = str(machine).replace(" ", "").replace("/", "_").replace("\\", "_").replace(":", "-")
-    return f"{date_str}_{time_part}_{safe_machine}_{suffix}.csv"
-
-# ========= Island Master (island.csv) =========
-ISLAND_COLS = ["unit_number","island_id","side","pos","edge_type","is_end"]
-
-def load_island_master(uploaded_file) -> pd.DataFrame:
-    dfm = pd.read_csv(uploaded_file)
-    missing = [c for c in ISLAND_COLS if c not in dfm.columns]
-    if missing:
-        raise ValueError(f"島マスタの列が不足しています: {missing}")
-
-    dfm = dfm.copy()
-    dfm["unit_number"] = pd.to_numeric(dfm["unit_number"], errors="coerce").astype("Int64")
-    dfm["pos"] = pd.to_numeric(dfm["pos"], errors="coerce").astype("Int64")
-    dfm["is_end"] = pd.to_numeric(dfm["is_end"], errors="coerce").fillna(0).astype(int)
-
-    dfm["island_id"] = dfm["island_id"].astype(str).str.strip()
-    dfm["side"] = dfm["side"].astype(str).str.strip().str.upper()
-    dfm["edge_type"] = dfm["edge_type"].astype(str).str.strip().str.lower()
-
-    return dfm[ISLAND_COLS].copy()
-
-def validate_island_master(dfm: pd.DataFrame) -> list[str]:
-    errs = []
-
-    if dfm["unit_number"].isna().any():
-        errs.append("unit_number に欠損があります（数値に変換できない行がある）")
-    if dfm["unit_number"].duplicated().any():
-        errs.append("unit_number が重複しています")
-    if dfm.duplicated(["island_id","side","pos"]).any():
-        errs.append("(island_id, side, pos) が重複しています")
-
-    ok_edge = {"wall","aisle","center"}
-    if (~dfm["edge_type"].isin(ok_edge)).any():
-        errs.append(f"edge_type は {sorted(list(ok_edge))} のみ対応です（不正値あり）")
-
-    ok_side = {"L","R","S"}
-    if (~dfm["side"].isin(ok_side)).any():
-        errs.append("side は L/R/S のみ対応です（不正値あり）")
-
-    if (~dfm["is_end"].isin([0,1])).any():
-        errs.append("is_end は 0/1 のみ対応です（不正値あり）")
-
-    dfm2 = dfm.dropna(subset=["pos"]).copy()
-    for (island, side), g in dfm2.groupby(["island_id","side"]):
-        poss = sorted(g["pos"].astype(int).tolist())
-        if not poss:
-            continue
-        exp = list(range(1, max(poss)+1))
-        if poss != exp:
-            errs.append(f"{island}-{side}: posが連番ではありません（欠番あり）")
-        maxpos = max(poss)
-        end_bad = g[((g["pos"]==1) | (g["pos"]==maxpos)) & (g["is_end"]!=1)]
-        if not end_bad.empty:
-            errs.append(f"{island}-{side}: 端(pos=1 or {maxpos})なのに is_end!=1 の行があります")
-
-    return errs
-
-def attach_island_info(df_all: pd.DataFrame, island_master: pd.DataFrame) -> pd.DataFrame:
-    out = df_all.copy()
-    out["unit_number"] = pd.to_numeric(out["unit_number"], errors="coerce").astype("Int64")
-    out = out.merge(island_master, on="unit_number", how="left")
-    return out
-
-# ========= Play Log (append to uploaded CSV) =========
-PLAYLOG_HEADER = [
-    "created_at",
-    "date","shop","machine","unit_number",
-    "tool_rank",
-    "select_reason",
-    "start_time","end_time",
-    "invest_medals","payout_medals","profit_medals",
-    "play_games",
-    "stop_reason","memo"
-]
-
-def append_row_to_uploaded_csv(uploaded_bytes: bytes, new_row: dict) -> bytes:
-    df = pd.read_csv(io.BytesIO(uploaded_bytes))
-    for c in PLAYLOG_HEADER:
-        if c not in df.columns:
-            df[c] = np.nan
-    df = df[PLAYLOG_HEADER]
-    df2 = pd.DataFrame([new_row], columns=PLAYLOG_HEADER)
-    out = pd.concat([df, df2], ignore_index=True)
-    return out.to_csv(index=False).encode("utf-8-sig")
-
-def make_log_filename(date_str: str) -> str:
-    time_part = datetime.now(JST).strftime("%H-%M-%S")
-    return f"{date_str}_{time_part}_playlog.csv"
-
-# ========= Backtest helpers =========
+# ============================================================
+# 朝イチ：ランキング & バックテスト（あなたの朝イチロジック）
+# ============================================================
 def make_threshold_df(min_games_fallback: int, max_rb_fallback: float, max_gassan_fallback: float) -> pd.DataFrame:
     rows = []
     for m in MACHINE_PRESETS:
-        rec = RECOMMENDED.get(m)
+        rec = RECOMMENDED_MORNING.get(m)
         if rec:
             rows.append({"machine": m, "min_games": int(rec["min_games"]), "max_rb": float(rec["max_rb"]), "max_gassan": float(rec["max_gassan"])})
         else:
@@ -360,7 +443,6 @@ def add_is_good_day(df: pd.DataFrame, thr_df: pd.DataFrame) -> pd.DataFrame:
         (out["rb_rate_num"] <= out["max_rb"]) &
         (out["gassan_rate_num"] <= out["max_gassan"])
     ).astype(int)
-
     return out
 
 def build_ranking(
@@ -396,8 +478,7 @@ def build_ranking(
     for c in ["island_id","side","pos","edge_type","is_end"]:
         if c not in df.columns:
             df[c] = np.nan
-    if "is_end" in df.columns:
-        df["is_end"] = pd.to_numeric(df["is_end"], errors="coerce").fillna(0).astype(int)
+    df["is_end"] = pd.to_numeric(df["is_end"], errors="coerce").fillna(0).astype(int)
 
     df["unit_number"] = pd.to_numeric(df["unit_number"], errors="coerce")
     df = df[df["unit_number"].notna()].copy()
@@ -443,13 +524,11 @@ def build_ranking(
     wmax = float(agg_u["w_sum"].max() if agg_u["w_sum"].notna().any() else 0.0)
     trust = np.log1p(agg_u["w_sum"].fillna(0.0)) / np.log1p(wmax + 1e-9) if wmax > 0 else 0.0
 
-    agg_u["unit_score"] = (
-        (agg_u["good_rate_weighted"].fillna(0.0) * 1.0) * 0.70 +
-        (trust * 1.0) * 0.30
-    )
+    agg_u["unit_score"] = (agg_u["good_rate_weighted"].fillna(0.0) * 0.70 + trust * 0.30)
 
     out = agg_u.copy()
 
+    # island_score
     if out["island_id"].isna().all():
         out["island_score"] = 0.0
     else:
@@ -458,13 +537,10 @@ def build_ranking(
             i_good_w=("is_good_day", lambda s: float(np.sum(s.values * df.loc[s.index, "w"].values))),
         ).reset_index()
         agg_i["island_score"] = (agg_i["i_good_w"] / agg_i["i_w_sum"]).replace([np.inf,-np.inf], np.nan).fillna(0.0)
-        out = out.merge(
-            agg_i[["shop","machine","island_id","island_score"]],
-            on=["shop","machine","island_id"],
-            how="left"
-        )
+        out = out.merge(agg_i[["shop","machine","island_id","island_score"]], on=["shop","machine","island_id"], how="left")
         out["island_score"] = out["island_score"].fillna(0.0)
 
+    # run_score
     if out["pos"].isna().all() or out["side"].isna().all():
         out["run_score"] = 0.0
     else:
@@ -558,7 +634,7 @@ def backtest_precision_hit(
     rows = []
     for day in eval_days:
         for m in machines:
-            rec = RECOMMENDED.get(m)
+            rec = RECOMMENDED_MORNING.get(m)
             mg = int(rec["min_games"]) if rec else int(min_games_fallback)
             mrb = float(rec["max_rb"]) if rec else float(max_rb_fallback)
             mgs = float(rec["max_gassan"]) if rec else float(max_gassan_fallback)
@@ -671,102 +747,178 @@ def backtest_precision_hit(
 
     return detail, overall_df, per_machine_df
 
-# ========= Sidebar =========
-if "min_games" not in st.session_state:
-    st.session_state["min_games"] = 2500
-if "max_rb" not in st.session_state:
-    st.session_state["max_rb"] = 290.0
-if "max_gassan" not in st.session_state:
-    st.session_state["max_gassan"] = 195.0
+# ============================================================
+# 統合ログ（一本化）
+# ============================================================
+PLAYLOG_HEADER = [
+    "created_at",
+    "date", "weekday", "shop", "machine", "unit_number",
+    "tool_phase",        # morning / evening / none
+    "tool_rank",         # 朝イチrank or 夕方候補順位
+    "tool_score",        # 朝イチ final_score or 夕方 score
+    "thr_min_games", "thr_max_rb", "thr_max_gassan",
+    "tool_logic",        # morning_rank / evening_filter など
+    "tool_version",
+    "select_reason",
+    "start_time", "end_time",
+    "invest_medals", "payout_medals", "profit_medals",
+    "play_games",
+    "stop_reason", "memo"
+]
 
-def apply_recommended(machine_name: str):
-    rec = RECOMMENDED.get(machine_name)
-    if not rec:
-        return
-    st.session_state["min_games"] = int(rec["min_games"])
-    st.session_state["max_rb"] = float(rec["max_rb"])
-    st.session_state["max_gassan"] = float(rec["max_gassan"])
+def append_row_to_uploaded_csv(uploaded_bytes: bytes, new_row: dict) -> bytes:
+    try:
+        df = pd.read_csv(io.BytesIO(uploaded_bytes))
+    except Exception:
+        df = pd.DataFrame(columns=PLAYLOG_HEADER)
+
+    for c in PLAYLOG_HEADER:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df[PLAYLOG_HEADER]
+
+    df2 = pd.DataFrame([new_row], columns=PLAYLOG_HEADER)
+    out = pd.concat([df, df2], ignore_index=True)
+    return out.to_csv(index=False).encode("utf-8-sig")
+
+def make_log_filename(date_str: str) -> str:
+    time_part = datetime.now(JST).strftime("%H-%M-%S")
+    return f"{date_str}_{time_part}_playlog_unified.csv"
+
+# ============================================================
+# Sidebar（デザイン差が影響しないように：キー分離 & Expander分離）
+# ============================================================
+# session_state defaults（朝/夕 で別キー）
+if "morning_min_games" not in st.session_state:
+    st.session_state["morning_min_games"] = 2500
+if "morning_max_rb" not in st.session_state:
+    st.session_state["morning_max_rb"] = 290.0
+if "morning_max_gassan" not in st.session_state:
+    st.session_state["morning_max_gassan"] = 195.0
+
+if "evening_min_games" not in st.session_state:
+    st.session_state["evening_min_games"] = 3000
+if "evening_max_rb" not in st.session_state:
+    st.session_state["evening_max_rb"] = 270.0
+if "evening_max_gassan" not in st.session_state:
+    st.session_state["evening_max_gassan"] = 180.0
 
 with st.sidebar:
-    st.header("補完情報（date / shop / machine）")
-    d = st.date_input("基準日（今日）", value=date.today())
+    st.header("基本情報（共通）")
+    d = st.date_input("日付", value=date.today(), key="meta_date")
     date_str = d.strftime("%Y-%m-%d")
 
-    shop_mode = st.radio("店名", ["選択", "手入力"], horizontal=True)
+    shop_mode = st.radio("店名", ["選択", "手入力"], horizontal=True, key="shop_mode")
     if shop_mode == "選択":
-        shop = st.selectbox("shop", SHOP_PRESETS, index=0)
+        shop = st.selectbox("shop", SHOP_PRESETS, index=0, key="shop_select")
     else:
-        shop = st.text_input("shop", value="武蔵境")
+        shop = st.text_input("shop", value="武蔵境", key="shop_text")
 
-    machine_mode = st.radio("機種", ["選択", "手入力"], horizontal=True)
+    machine_mode = st.radio("機種", ["選択", "手入力"], horizontal=True, key="machine_mode")
     if machine_mode == "選択":
-        machine = st.selectbox(
-            "machine",
-            MACHINE_PRESETS,
-            index=0,
-            key="machine_select",
-            on_change=lambda: apply_recommended(st.session_state["machine_select"]),
-        )
-        machine = st.session_state["machine_select"]
+        machine = st.selectbox("machine", MACHINE_PRESETS, index=0, key="machine_select")
     else:
-        machine = st.text_input("machine", value="マイジャグラーV")
+        machine = st.text_input("machine", value="マイジャグラーV", key="machine_text")
 
-    rec = RECOMMENDED.get(machine)
-    with st.expander("おすすめ設定値（朝イチ用・補足）", expanded=False):
-        if rec:
-            st.caption("※ 朝イチ候補の“良台日判定”に使う目安です。候補が少なければ緩めてください。")
-            st.write(f"- 最低総回転: **{rec['min_games']}**")
-            st.write(f"- REG上限: **{rec['max_rb']}**")
-            st.write(f"- 合算上限: **{rec['max_gassan']}**")
-            if st.button("おすすめ値をスライダーに反映", use_container_width=True):
-                apply_recommended(machine)
+    st.caption(f"ツールVersion: {TOOL_VERSION}")
+
+    # --- 朝イチ設定 ---
+    st.divider()
+    with st.expander("朝イチ設定（学習ランキング）", expanded=True):
+        recm = RECOMMENDED_MORNING.get(machine)
+        if recm:
+            st.caption("※ 朝イチ候補の“良台日判定”目安（機種別）")
+            st.write(f"- 最低総回転: **{recm['min_games']}**")
+            st.write(f"- REG上限: **{recm['max_rb']}**")
+            st.write(f"- 合算上限: **{recm['max_gassan']}**")
+            if st.button("朝イチおすすめ値を反映", use_container_width=True, key="btn_apply_morning"):
+                st.session_state["morning_min_games"] = int(recm["min_games"])
+                st.session_state["morning_max_rb"] = float(recm["max_rb"])
+                st.session_state["morning_max_gassan"] = float(recm["max_gassan"])
                 st.rerun()
         else:
-            st.caption("この機種はプリセット未登録です。手動でスライダーを調整してください。")
+            st.caption("この機種は朝イチプリセット未登録です。手動で調整してください。")
 
+        st.subheader("スコア重み（島マスタ前提）")
+        w_island = st.slider("島（island）の重み", 0.0, 1.0, 0.45, 0.05, key="morning_w_island")
+        w_run    = st.slider("並び（run）の重み",   0.0, 1.0, 0.35, 0.05, key="morning_w_run")
+        w_end    = st.slider("端（end）の重み",     0.0, 1.0, 0.10, 0.05, key="morning_w_end")
+        w_unit = max(0.0, 1.0 - (w_island + w_run + w_end))
+        st.caption(f"台単体の重み（自動目安）: {w_unit:.2f}  ※ 合計>1でも内部で正規化")
+
+        st.subheader("良台日判定（朝イチ）")
+        morning_min_games = st.slider(
+            "最低 総回転（total_start）",
+            0, 10000,
+            value=int(st.session_state["morning_min_games"]),
+            step=100,
+            key="morning_min_games_slider",
+        )
+        morning_max_rb = st.slider(
+            "REG上限（rb_rate）",
+            150.0, 600.0,
+            value=float(st.session_state["morning_max_rb"]),
+            step=1.0,
+            key="morning_max_rb_slider",
+        )
+        morning_max_gassan = st.slider(
+            "合算上限（gassan_rate）",
+            80.0, 350.0,
+            value=float(st.session_state["morning_max_gassan"]),
+            step=1.0,
+            key="morning_max_gassan_slider",
+        )
+
+        lookback_days = st.number_input("集計対象：過去何日（学習窓）", 1, 365, 60, 1, key="morning_lookback")
+        tau = st.number_input("日付減衰 τ（小さいほど直近重視）", 1, 120, 14, 1, key="morning_tau")
+        min_unique_days = st.number_input("最小サンプル日数（稼働日数）", 1, 60, 3, 1, key="morning_min_unique")
+        morning_top_n = st.number_input("上位N件表示（朝イチ）", 1, 200, 30, 1, key="morning_topn")
+
+    # --- 夕方設定 ---
     st.divider()
-    st.header("朝イチ候補スコア（島マスタ前提）")
+    with st.expander("夕方設定（当日フィルタ）", expanded=True):
+        rece = RECOMMENDED_EVENING.get(machine)
+        if rece:
+            st.caption("※ 夕方続行候補を“厳しめに抽出”する目安（機種別）")
+            st.write(f"- 最低総回転: **{rece['min_games']}**")
+            st.write(f"- REG上限: **{rece['max_rb']}**")
+            st.write(f"- 合算上限: **{rece['max_gassan']}**")
+            if st.button("夕方おすすめ値を反映", use_container_width=True, key="btn_apply_evening"):
+                st.session_state["evening_min_games"] = int(rece["min_games"])
+                st.session_state["evening_max_rb"] = float(rece["max_rb"])
+                st.session_state["evening_max_gassan"] = float(rece["max_gassan"])
+                st.rerun()
+        else:
+            st.caption("この機種は夕方プリセット未登録です。手動で調整してください。")
 
-    w_island = st.slider("島（island）の重み", 0.0, 1.0, 0.45, 0.05)
-    w_run    = st.slider("並び（run）の重み",   0.0, 1.0, 0.35, 0.05)
-    w_end    = st.slider("端（end）の重み",     0.0, 1.0, 0.10, 0.05)
+        evening_min_games = st.slider(
+            "最低 総回転（total_start）",
+            0, 10000,
+            value=int(st.session_state["evening_min_games"]),
+            step=100,
+            key="evening_min_games_slider",
+        )
+        evening_max_rb = st.slider(
+            "REG上限（rb_rate）",
+            150.0, 600.0,
+            value=float(st.session_state["evening_max_rb"]),
+            step=1.0,
+            key="evening_max_rb_slider",
+        )
+        evening_max_gassan = st.slider(
+            "合算上限（gassan_rate）",
+            80.0, 350.0,
+            value=float(st.session_state["evening_max_gassan"]),
+            step=1.0,
+            key="evening_max_gassan_slider",
+        )
+        evening_top_n = st.number_input("上位N件表示（夕方）", 1, 200, 30, 1, key="evening_topn")
 
-    w_unit = max(0.0, 1.0 - (w_island + w_run + w_end))
-    st.caption(f"台単体の重み（自動の目安）: {w_unit:.2f}  ※ 合計が1を超えても内部で正規化します")
-
-    st.divider()
-    st.header("良台日判定（スライダー）")
-
-    min_games = st.slider(
-        "良台日判定：最低 総回転（total_start）",
-        0, 10000,
-        value=int(st.session_state["min_games"]),
-        step=100,
-        key="min_games",
-    )
-    max_rb = st.slider(
-        "良台日判定：REG上限（rb_rate）",
-        150.0, 600.0,
-        value=float(st.session_state["max_rb"]),
-        step=1.0,
-        key="max_rb",
-    )
-    max_gassan = st.slider(
-        "良台日判定：合算上限（gassan_rate）",
-        80.0, 350.0,
-        value=float(st.session_state["max_gassan"]),
-        step=1.0,
-        key="max_gassan",
-    )
-
-    lookback_days = st.number_input("集計対象：過去何日（学習窓）", 1, 365, 60, 1)
-    tau = st.number_input("日付減衰 τ（小さいほど直近重視）", 1, 120, 14, 1)
-    min_unique_days = st.number_input("最小サンプル日数（稼働日数）", 1, 60, 3, 1)
-    top_n = st.number_input("上位N件表示（候補テーブル）", 1, 200, 30, 1)
-
-# --------- 共通：過去データの投入（＋統合DL機能） ---------
+# ============================================================
+# 共通UI：過去データ統合（朝イチ/バックテスト用）
+# ============================================================
 def upload_past_data_ui():
-    st.caption("複数CSV（original.csv）または zip（CSVをまとめたもの）をアップロードしてください。")
+    st.caption("複数CSV（original.csv）または zip（CSVまとめ）をアップロードしてください。")
     st.caption("※ date/shop/machine がCSV内に無い場合：ファイル名（YYYY-MM-DD_機種...）→無ければサイドバー値で補完します。")
     st.caption("★ weekday は『統合時に date から自動生成』します（入力不要）")
 
@@ -788,13 +940,13 @@ def upload_past_data_ui():
 
     if (not past_files) and (past_zip is None):
         st.info("ここに過去データを入れると、店×機種で候補台をランキングします。")
-        return pd.DataFrame(columns=HEADER)
+        return pd.DataFrame(columns=BASE_HEADER)
 
     default_shop = shop
     default_date = d
     default_machine = machine
 
-    df_all = pd.DataFrame(columns=HEADER)
+    df_all = pd.DataFrame(columns=BASE_HEADER)
     if past_files:
         df_all = pd.concat(
             [df_all, load_many_csvs(past_files, default_shop=default_shop, default_date=default_date, default_machine=default_machine)],
@@ -808,12 +960,7 @@ def upload_past_data_ui():
 
     if df_all.empty:
         st.error("CSVが読み込めませんでした（中身が空/形式違いの可能性）。")
-        return pd.DataFrame(columns=HEADER)
-
-    # 念のため：統合後にもう一度 weekday を整合（date欠損が埋まったケース対策）
-    df_all["date"] = pd.to_datetime(df_all["date"], errors="coerce")
-    df_all = add_weekday_column(df_all)
-    df_all["date"] = pd.to_datetime(df_all["date"], errors="coerce").dt.date
+        return pd.DataFrame(columns=BASE_HEADER)
 
     do_dedup = st.checkbox(
         "統合時に重複行を除去（date+shop+machine+unit_number が同一なら最後の行を採用）",
@@ -840,147 +987,354 @@ def upload_past_data_ui():
 
     return df_all
 
-# ========= Main UI =========
-st.divider()
-st.subheader("共通：過去データアップロード（朝イチ候補で使用）")
-df_all_shared = upload_past_data_ui()
-
-st.subheader("共通：島マスタアップロード（island.csv）")
-island_file = st.file_uploader("島マスタ（island.csv）をアップロード", type=["csv"], key="island_csv")
-
-island_master = None
-if island_file is None:
-    st.info("島マスタが未指定です。島/並び/端の評価は 0 として扱い、台単体のみでランキングします。")
-else:
-    try:
-        island_master = load_island_master(island_file)
-        errs = validate_island_master(island_master)
-        if errs:
-            st.error("島マスタに問題があります:\n- " + "\n- ".join(errs))
-            st.stop()
-        st.success(f"島マスタ読込OK：{len(island_master)}台")
-    except Exception as e:
-        st.error(f"島マスタの読み込みに失敗しました: {e}")
-        st.stop()
-
-if (island_master is not None) and (not df_all_shared.empty):
-    df_all_shared = attach_island_info(df_all_shared, island_master)
-    miss = df_all_shared[df_all_shared["island_id"].isna()]["unit_number"].dropna().unique().tolist()
-    if miss:
-        st.warning(f"島マスタに存在しない台番号が過去データに含まれています（例）: {miss[:10]}")
-
-tab1, tab2, tab3 = st.tabs([
-    "朝イチ候補（過去データ集計）",
-    "実戦ログ（CSVに追記して更新版DL）",
-    "バックテスト（ツール精度検証）"
+# ============================================================
+# Main Tabs
+# ============================================================
+tab_common, tab_morning, tab_evening_in, tab_evening_pick, tab_log, tab_bt = st.tabs([
+    "共通：データ統合 / 島マスタ",
+    "朝イチ：候補ランキング",
+    "夕方：入力→変換（統一CSV作成）",
+    "夕方：続行候補（判定）",
+    "実戦ログ（統合）",
+    "バックテスト（朝イチ精度）",
 ])
 
-with tab1:
-    st.subheader("① 朝イチ候補（過去の original.csv を集計してランキング）")
+# -------- 共通：統合データ & 島マスタ --------
+with tab_common:
+    st.subheader("共通：過去データアップロード（朝イチ・バックテストで使用）")
+    df_all_shared = upload_past_data_ui()
+
+    st.divider()
+    st.subheader("共通：島マスタアップロード（island.csv）")
+    island_file = st.file_uploader("島マスタ（island.csv）をアップロード", type=["csv"], key="island_csv_common")
+
+    island_master = None
+    if island_file is None:
+        st.info("島マスタが未指定です。島/並び/端の評価は 0 として扱い、台単体のみでランキングします。")
+    else:
+        try:
+            island_master = load_island_master(island_file)
+            errs = validate_island_master(island_master)
+            if errs:
+                st.error("島マスタに問題があります:\n- " + "\n- ".join(errs))
+                st.stop()
+            st.success(f"島マスタ読込OK：{len(island_master)}台")
+        except Exception as e:
+            st.error(f"島マスタの読み込みに失敗しました: {e}")
+            st.stop()
+
+    if (island_master is not None) and (not df_all_shared.empty):
+        df_all_shared = attach_island_info(df_all_shared, island_master)
+        miss = df_all_shared[df_all_shared["island_id"].isna()]["unit_number"].dropna().unique().tolist()
+        if miss:
+            st.warning(f"島マスタに存在しない台番号が過去データに含まれています（例）: {miss[:10]}")
+
+    # 共有（他タブで使う）
+    st.session_state["df_all_shared"] = df_all_shared
+    st.session_state["island_master"] = island_master
+
+# -------- 朝イチ：候補ランキング --------
+with tab_morning:
+    st.subheader("朝イチ候補（過去の original.csv を集計してランキング）")
+
+    df_all_shared = st.session_state.get("df_all_shared", pd.DataFrame(columns=BASE_HEADER))
+    island_master = st.session_state.get("island_master", None)
 
     if df_all_shared.empty:
-        st.info("上の『共通：過去データアップロード』にCSV/zipを入れてください。")
-    else:
-        base_day = pd.to_datetime(date_str).date()
+        st.info("『共通：データ統合 / 島マスタ』で過去データを投入してください。")
+        st.stop()
 
-        ranking = build_ranking(
-            df_all=df_all_shared,
-            shop=shop,
-            machine=machine,
-            base_day=base_day,
-            lookback_days=int(lookback_days),
-            tau=int(tau),
-            min_games=int(min_games),
-            max_rb=float(max_rb),
-            max_gassan=float(max_gassan),
-            min_unique_days=int(min_unique_days),
-            w_unit=float(w_unit),
-            w_island=float(w_island),
-            w_run=float(w_run),
-            w_end=float(w_end),
+    base_day = pd.to_datetime(date_str).date()
+
+    ranking = build_ranking(
+        df_all=df_all_shared,
+        shop=shop,
+        machine=machine,
+        base_day=base_day,
+        lookback_days=int(lookback_days),
+        tau=int(tau),
+        min_games=int(morning_min_games),
+        max_rb=float(morning_max_rb),
+        max_gassan=float(morning_max_gassan),
+        min_unique_days=int(min_unique_days),
+        w_unit=float(w_unit),
+        w_island=float(w_island),
+        w_run=float(w_run),
+        w_end=float(w_end),
+    )
+
+    if ranking.empty:
+        st.warning("指定した条件でランキングが作れません（データ不足/サンプル不足）。条件を緩めてください。")
+        st.stop()
+
+    train_start = ranking["train_start"].iloc[0]
+    train_end = ranking["train_end"].iloc[0]
+    st.success(f"学習期間：{train_start}〜{train_end}（対象：{shop} / {machine}）  |  台数: {len(ranking)}")
+
+    show_cols = [
+        "rank",
+        "unit_number",
+        "island_id","side","pos","edge_type","is_end",
+        "final_score",
+        "island_score","run_score","unit_score","end_bonus",
+        "good_rate_weighted","good_rate_simple",
+        "unique_days","samples","w_sum",
+        "avg_rb","avg_gassan","max_total",
+        "weights"
+    ]
+    show_cols = [c for c in show_cols if c in ranking.columns]
+
+    st.dataframe(ranking.head(int(morning_top_n))[show_cols], use_container_width=True, hide_index=True)
+
+    st.session_state["last_morning_ranking"] = ranking
+
+    filename = make_filename(machine, "morning_candidates", date_str)
+    st.download_button(
+        "候補台ランキングをCSVでダウンロード",
+        data=to_csv_bytes(ranking),
+        file_name=filename,
+        mime="text/csv",
+        key="tab_morning_dl_candidates"
+    )
+
+# -------- 夕方：入力→変換 --------
+with tab_evening_in:
+    st.subheader("夕方：入力 → 変換（統一済みCSVを作成してダウンロード）")
+    st.caption("入力（CSV or 生テキスト12列）→ ヘッダー統一（weekday含む）→ 統一CSVを作成")
+
+    input_mode = st.radio("入力", ["CSVアップロード", "生データ貼り付け（12列）"], horizontal=True, key="evening_input_mode")
+    df_unified = None
+
+    if input_mode == "CSVアップロード":
+        uploaded = st.file_uploader("元CSVをアップロード（ヘッダーあり想定）", type=["csv"], key="evening_tab1_csv")
+        if uploaded:
+            df = read_csv_flexible(uploaded)
+            df = normalize_columns(df)
+            df = ensure_meta_columns(df, date_str, shop, machine)
+            df = compute_rates_if_needed(df)
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = add_weekday_column(df)
+            df_unified = align_to_base_header(df)
+
+    else:
+        sample = "478 45 3539 19 11 0 2481 1/186.3 1/321.7 0.0 118.0 449"
+        raw_text = st.text_area("台データオンラインの行を貼り付け（複数行OK）", value=sample, height=220, key="evening_raw")
+        if st.button("変換して統一CSVを作る", type="primary", key="evening_convert_btn"):
+            df_unified = parse_raw12(raw_text, date_str, shop, machine)
+
+    if df_unified is None:
+        st.info("入力を行うと、ここに統一済みデータが表示され、CSVダウンロードできます。")
+    else:
+        st.success(f"統一済みデータを作成しました：{len(df_unified)}行")
+        st.dataframe(df_unified.head(30), use_container_width=True, hide_index=True)
+
+        st.session_state["last_evening_unified"] = df_unified
+
+        filename = make_filename(machine, "original", date_str)
+        st.download_button(
+            "統一済みCSVをダウンロード",
+            data=to_csv_bytes(df_unified),
+            file_name=filename,
+            mime="text/csv",
+            key="evening_tab1_dl_unified"
+        )
+        st.caption("次に「夕方：続行候補（判定）」タブで、この統一CSVをアップロードして判定できます。")
+
+# -------- 夕方：続行候補 --------
+with tab_evening_pick:
+    st.subheader("夕方：続行候補（統一済みCSVをアップロードして判定）")
+    st.caption("条件：total_start / rb_rate / gassan_rate +（任意）並びボーナス で候補抽出")
+
+    island_master = st.session_state.get("island_master", None)
+
+    unified_file = st.file_uploader("統一済みCSV（unified.csv）をアップロード", type=["csv"], key="evening_tab2_unified")
+
+    if not unified_file:
+        st.info("上の入力欄で統一CSVを選択してください。")
+        # 直前に作った統一DFがあれば参考表示
+        df_last = st.session_state.get("last_evening_unified")
+        if isinstance(df_last, pd.DataFrame) and not df_last.empty:
+            with st.expander("直前に作成した統一データ（参考）", expanded=False):
+                st.dataframe(df_last.head(30), use_container_width=True, hide_index=True)
+        st.stop()
+
+    df = read_csv_flexible(unified_file)
+    df = normalize_columns(df)
+    df = compute_rates_if_needed(df)
+    df = ensure_meta_columns(df, date_str, shop, machine)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = add_weekday_column(df)
+    df = align_to_base_header(df)
+
+    # 島情報の結合（任意）
+    if island_master is not None and not island_master.empty:
+        df2 = df.copy()
+        df2["unit_number"] = pd.to_numeric(df2["unit_number"], errors="coerce").astype("Int64")
+        df2 = df2.merge(island_master, on="unit_number", how="left")
+        df = df2
+
+    df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
+    df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
+    df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
+
+    cand = df[
+        (df["total_start_num"] >= evening_min_games) &
+        (df["rb_rate_num"] <= evening_max_rb) &
+        (df["gassan_rate_num"] <= evening_max_gassan)
+    ].copy()
+
+    # 並びボーナス（当日候補内で隣接があれば加点）
+    cand["pos_num"] = pd.to_numeric(cand.get("pos", np.nan), errors="coerce")
+    cand["run_bonus"] = 0
+
+    if "island_id" in cand.columns and cand["island_id"].notna().any():
+        key_cols = ["island_id", "side"]
+        pos_map = (
+            cand.dropna(subset=["pos_num"])
+            .groupby(key_cols)["pos_num"]
+            .apply(lambda s: set(s.astype(int)))
+            .to_dict()
         )
 
-        if ranking.empty:
-            st.warning("指定した条件でランキングが作れません（データ不足/サンプル不足）。条件を緩めてください。")
-        else:
-            train_start = ranking["train_start"].iloc[0]
-            train_end = ranking["train_end"].iloc[0]
-            st.success(f"学習期間：{train_start}〜{train_end}（対象：{shop} / {machine}）  |  台数: {len(ranking)}")
+        def _run_bonus(row):
+            if pd.isna(row["pos_num"]):
+                return 0
+            k = (row.get("island_id", None), row.get("side", None))
+            if k not in pos_map:
+                return 0
+            p = int(row["pos_num"])
+            s = pos_map[k]
+            return 1 if ((p - 1 in s) or (p + 1 in s)) else 0
 
-            show_cols = [
-                "rank",
-                "unit_number",
-                "island_id","side","pos","edge_type","is_end",
-                "final_score",
-                "island_score","run_score","unit_score","end_bonus",
-                "good_rate_weighted","good_rate_simple",
-                "unique_days","samples","w_sum",
-                "avg_rb","avg_gassan","max_total",
-                "weights"
-            ]
-            show_cols = [c for c in show_cols if c in ranking.columns]
+        cand["run_bonus"] = cand.apply(_run_bonus, axis=1).astype(int)
 
-            st.dataframe(ranking.head(int(top_n))[show_cols], use_container_width=True, hide_index=True)
+    if cand.empty:
+        st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
+        st.stop()
 
-            filename = make_filename(machine, "morning_candidates", date_str)
-            st.download_button(
-                "候補台ランキングをCSVでダウンロード",
-                data=to_csv_bytes(ranking),
-                file_name=filename,
-                mime="text/csv",
-                key="tab1_dl_candidates"
-            )
+    eps = 1e-9
+    rb = cand["rb_rate_num"].replace(0, np.nan)
+    gs = cand["gassan_rate_num"].replace(0, np.nan)
 
-with tab2:
-    st.subheader("② 実戦ログ（ローカルCSVに追記 → 更新版をダウンロード）")
+    cand["score"] = (
+        (evening_max_rb / (rb + eps)) * 70 +
+        (cand["total_start_num"] / max(evening_min_games, 1)) * 20 +
+        (evening_max_gassan / (gs + eps)) * 10
+    )
+    cand["score"] = cand["score"] + (cand["run_bonus"] * 1.5)
+    cand["score"] = cand["score"].replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    # 表示はRB優先＋同率なら回転数（従来通り）
+    cand = cand.sort_values(["rb_rate_num", "total_start_num"], ascending=[True, False]).copy()
+    cand["evening_rank"] = np.arange(1, len(cand) + 1)
+
+    show_cols = [
+        "evening_rank",
+        "date", "weekday", "shop", "machine",
+        "unit_number", "total_start", "bb_count", "rb_count",
+        "bb_rate", "rb_rate", "gassan_rate",
+        "run_bonus", "score"
+    ]
+    show_cols = [c for c in show_cols if c in cand.columns]
+    show = cand[show_cols].copy()
+
+    for c in ["bb_rate", "rb_rate", "gassan_rate", "score"]:
+        if c in show.columns:
+            show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
+
+    st.dataframe(show.head(int(evening_top_n)), use_container_width=True, hide_index=True)
+    st.session_state["last_evening_candidates"] = cand
+
+    filename = make_filename(machine, "evening_candidates", date_str)
+    st.download_button(
+        "夕方候補台をCSVでダウンロード",
+        data=to_csv_bytes(show),
+        file_name=filename,
+        mime="text/csv",
+        key="evening_tab2_dl_candidates"
+    )
+
+# -------- 実戦ログ（統合） --------
+with tab_log:
+    st.subheader("実戦ログ（統合：朝イチ/夕方を1ファイルで管理）")
     st.caption("※ Streamlit Cloudではローカルファイルを直接書き換えできないため、追記した“更新版CSV”を生成してダウンロードします。")
 
     uploaded_log = st.file_uploader(
-        "追記したいログCSVを選択（既存のplay_log.csvなど）",
+        "追記したいログCSVを選択（既存の playlog_unified.csv など）",
         type=["csv"],
-        key="tab2_log_upload"
+        key="log_upload_unified"
     )
 
     st.divider()
 
-    with st.form("playlog_form", clear_on_submit=True):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            log_date = st.text_input("date（YYYY-MM-DD）", value=date_str)
-            log_shop = st.text_input("shop", value=shop)
-        with col2:
-            log_machine = st.text_input("machine", value=machine)
-            unit_number = st.number_input("unit_number（台番号）", min_value=0, step=1, value=0)
-            tool_rank = st.number_input("tool_rank（ツール候補順位）", min_value=0, step=1, value=0)
+    # ログ入力（tool_phaseで自動補完）
+    with st.form("playlog_form_unified", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            log_date = st.text_input("date（YYYY-MM-DD）", value=date_str, key="log_date")
+            # weekday は date から自動生成して保存
+            log_shop = st.text_input("shop", value=shop, key="log_shop")
+        with c2:
+            log_machine = st.text_input("machine", value=machine, key="log_machine")
+            unit_number = st.number_input("unit_number（台番号）", min_value=0, step=1, value=0, key="log_unit")
+        with c3:
+            tool_phase = st.selectbox("tool_phase", ["morning", "evening", "none"], index=0, key="log_phase")
+            tool_rank = st.number_input("tool_rank（候補順位）", min_value=0, step=1, value=0, key="log_rank")
+            tool_score = st.number_input("tool_score（候補スコア）", value=0.0, step=0.1, key="log_score")
 
-            select_reason = st.selectbox(
-                "select_reason（着席理由）",
-                ["", "ツール上位", "末尾が強い", "角/角2", "並び/帯が強い", "前日挙動", "直感", "空き台都合", "その他"]
-            )
-        with col3:
-            play_games = st.number_input("play_games（自分が回したG数）", min_value=0, step=10, value=0)
+        # 閾値：phaseに応じてデフォルト補完（編集も可能）
+        if tool_phase == "morning":
+            thr_min = int(morning_min_games)
+            thr_rb = float(morning_max_rb)
+            thr_gs = float(morning_max_gassan)
+            tool_logic = "morning_rank"
+        elif tool_phase == "evening":
+            thr_min = int(evening_min_games)
+            thr_rb = float(evening_max_rb)
+            thr_gs = float(evening_max_gassan)
+            tool_logic = "evening_filter"
+        else:
+            thr_min, thr_rb, thr_gs = (np.nan, np.nan, np.nan)
+            tool_logic = "none"
 
-        col4, col5, col6 = st.columns(3)
-        with col4:
-            start_time = st.text_input("start_time（例 09:05）", value="")
-        with col5:
-            end_time = st.text_input("end_time（例 11:20）", value="")
-        with col6:
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            thr_min_games_in = st.number_input("thr_min_games（使用閾値）", value=float(thr_min) if pd.notna(thr_min) else 0.0, step=100.0, key="log_thr_min")
+        with c5:
+            thr_max_rb_in = st.number_input("thr_max_rb（使用閾値）", value=float(thr_rb) if pd.notna(thr_rb) else 0.0, step=1.0, key="log_thr_rb")
+        with c6:
+            thr_max_gassan_in = st.number_input("thr_max_gassan（使用閾値）", value=float(thr_gs) if pd.notna(thr_gs) else 0.0, step=1.0, key="log_thr_gs")
+
+        select_reason = st.selectbox(
+            "select_reason（着席理由）",
+            ["", "ツール上位", "末尾が強い", "角/角2", "並び/帯が強い", "前日挙動", "直感", "空き台都合", "その他"],
+            key="log_reason"
+        )
+
+        c7, c8, c9 = st.columns(3)
+        with c7:
+            start_time = st.text_input("start_time（例 09:05 / 18:10）", value="", key="log_start")
+        with c8:
+            end_time = st.text_input("end_time（例 11:20 / 20:45）", value="", key="log_end")
+        with c9:
             stop_reason = st.selectbox(
                 "stop_reason（ヤメ理由）",
-                ["", "様子見終了", "REG悪化", "合算悪化", "資金切れ", "他に移動", "閉店", "その他"]
+                ["", "様子見終了", "REG悪化", "合算悪化", "資金切れ", "他に移動", "閉店", "その他"],
+                key="log_stop"
             )
 
-        col7, col8, col9 = st.columns(3)
-        with col7:
-            invest = st.number_input("invest_medals（投資枚）", min_value=0, step=50, value=0)
-        with col8:
-            payout = st.number_input("payout_medals（回収枚）", min_value=0, step=50, value=0)
-        with col9:
+        c10, c11, c12 = st.columns(3)
+        with c10:
+            invest = st.number_input("invest_medals（投資枚）", min_value=0, step=50, value=0, key="log_invest")
+        with c11:
+            payout = st.number_input("payout_medals（回収枚）", min_value=0, step=50, value=0, key="log_payout")
+        with c12:
             profit = int(payout - invest)
             st.metric("profit_medals（収支枚）", profit)
 
-        memo = st.text_area("memo（任意）", value="", height=100)
+        play_games = st.number_input("play_games（自分が回したG数）", min_value=0, step=10, value=0, key="log_games")
+        memo = st.text_area("memo（任意）", value="", height=120, key="log_memo")
+
         submit = st.form_submit_button("この内容で追記用データを作成", type="primary")
 
     if submit:
@@ -988,13 +1342,25 @@ with tab2:
             st.error("先に「追記したいログCSV」を選択してください。")
             st.stop()
 
+        # date→weekday 自動生成
+        dt = pd.to_datetime(log_date, errors="coerce")
+        wd = JP_WEEKDAYS[int(dt.dayofweek)] if pd.notna(dt) else ""
+
         new_row = {
             "created_at": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S"),
             "date": log_date,
+            "weekday": wd,
             "shop": log_shop,
             "machine": log_machine,
             "unit_number": int(unit_number),
+            "tool_phase": tool_phase,
             "tool_rank": int(tool_rank),
+            "tool_score": float(tool_score),
+            "thr_min_games": int(thr_min_games_in) if thr_min_games_in is not None else np.nan,
+            "thr_max_rb": float(thr_max_rb_in) if thr_max_rb_in is not None else np.nan,
+            "thr_max_gassan": float(thr_max_gassan_in) if thr_max_gassan_in is not None else np.nan,
+            "tool_logic": tool_logic,
+            "tool_version": TOOL_VERSION,
             "select_reason": select_reason,
             "start_time": start_time,
             "end_time": end_time,
@@ -1015,7 +1381,7 @@ with tab2:
             data=out_bytes,
             file_name=out_name,
             mime="text/csv",
-            key="tab2_log_download"
+            key="log_download_unified"
         )
 
         st.divider()
@@ -1023,51 +1389,31 @@ with tab2:
         preview_df = pd.read_csv(io.BytesIO(out_bytes))
         st.dataframe(preview_df.tail(5), use_container_width=True, hide_index=True)
 
-with tab3:
-    st.subheader("③ バックテスト（ツール精度検証：上位Nの良台率 / lift / Hit@N）")
-    st.caption("※ その日を予測する際、学習には前日までのデータのみ使用（リーク防止）。良台判定は機種別RECOMMENDED（無い機種はサイドバー値）を使用。")
+# -------- バックテスト（朝イチ精度） --------
+with tab_bt:
+    st.subheader("バックテスト（朝イチ精度検証：上位Nの良台率 / lift / Hit@N）")
+    st.caption("※ その日を予測する際、学習には前日までのデータのみ使用（リーク防止）。良台判定は朝イチRECOMMENDED（無い機種はサイドバー値）を使用。")
 
-    # -----------------------------
-    # 0) 結果保持（session_state）
-    # -----------------------------
+    df_all_shared = st.session_state.get("df_all_shared", pd.DataFrame(columns=BASE_HEADER))
+    if df_all_shared.empty:
+        st.info("まずは『共通：データ統合 / 島マスタ』で統合データを投入してください。")
+        st.stop()
+
+    # session_state init
     if "bt_detail" not in st.session_state:
         st.session_state["bt_detail"] = None
         st.session_state["bt_overall"] = None
         st.session_state["bt_per_machine"] = None
         st.session_state["bt_sig"] = None
 
-    # 指標の説明（ヘルプ）
     with st.expander("指標の説明（クリックで開く）", expanded=False):
         st.markdown("""
-### このバックテストがやっていること
-- ある日 **D** を評価したい  
-- 学習は **Dより前の日だけ** を使う（当日データは使わない＝リーク防止）  
-- 学習データでランキングを作り、当日Dの結果（良台だったか）で採点します
-
-### 良台日（当たり）の定義
-**min_games / max_rb / max_gassan** を満たす台を **良台（=1）** として扱います（機種別RECOMMENDEDがあればそれ優先）。
-
-### 各指標の意味
-- **topN**：ランキング上位から「何台を見るか」（Top10なら上位10台）
-- **selected_n**：その評価ケースで実際にTopNとして扱えた台数（通常N。候補不足でN未満になることがあります）
-- **good_in_topN**：TopNの中に「良台（当たり）」が何台あったか
-- **precision_topN**：TopNの良台率  `good_in_topN / selected_n`
-- **baseline_good_rate**：その日その機種の全体良台率（店の地合い） `good_all / all_units_n`
-- **lift_pt**：TopNが平均よりどれだけ有利か（ポイント差） `precision_topN - baseline_good_rate`
-- **hit_at_N**：TopNの中に当たりが1台でもあれば1、なければ0
-- **hit_rate**：hit_at_Nの平均（実戦向き）
-
-### 実戦的に何を見るべき？
-- **lift_pt**：ツールを使う価値（平均より当たりを寄せているか）
-- **hit_rate**：朝イチで“とりあえず当たり候補がある”確率
-- **precision_topN**：当たりの濃さ（効率よく当たりに触れたいなら重要）
+- **precision_topN**：TopNの良台率  
+- **baseline_good_rate**：その日その機種の全体良台率（店の地合い）  
+- **lift_pt**：TopNが平均よりどれだけ有利か（ポイント差）  
+- **hit_rate**：TopNの中に当たりが1台でもある確率  
 """)
 
-    if df_all_shared.empty:
-        st.info("まずは『共通：過去データアップロード』に統合データを投入してください。")
-        st.stop()
-
-    # shopフィルタ（存在チェック）
     df_tmp = df_all_shared.copy()
     df_tmp["date"] = pd.to_datetime(df_tmp["date"], errors="coerce").dt.date
     df_tmp = df_tmp[df_tmp["date"].notna()].copy()
@@ -1077,19 +1423,15 @@ with tab3:
         st.warning("この店名(shop)に一致するデータがありません。shop表記ゆれ（例：武蔵境/メッセ武蔵境）を確認してください。")
         st.stop()
 
-    # 評価可能な日付範囲
     all_days = sorted(df_tmp["date"].unique().tolist())
     min_day, max_day = all_days[0], all_days[-1]
 
-    # -----------------------------
-    # 1) 計算条件（ここを変えると再実行推奨）
-    # -----------------------------
-    colA, colB, colC = st.columns(3)
-    with colA:
+    cA, cB, cC = st.columns(3)
+    with cA:
         eval_start = st.date_input("評価開始日", value=min_day, min_value=min_day, max_value=max_day, key="bt_eval_start")
-    with colB:
+    with cB:
         eval_end = st.date_input("評価終了日", value=max_day, min_value=min_day, max_value=max_day, key="bt_eval_end")
-    with colC:
+    with cC:
         topN_text = st.text_input("TopN（カンマ区切り）", value="5,10,20,30", key="bt_topn")
 
     try:
@@ -1115,14 +1457,11 @@ with tab3:
 
     st.divider()
 
-    # -----------------------------
-    # 2) 実行 / クリア
-    # -----------------------------
     c1, c2 = st.columns([3, 1])
     with c1:
-        run_bt = st.button("バックテストを実行", type="primary", use_container_width=True)
+        run_bt = st.button("バックテストを実行", type="primary", use_container_width=True, key="bt_run")
     with c2:
-        clear_bt = st.button("結果をクリア", use_container_width=True)
+        clear_bt = st.button("結果をクリア", use_container_width=True, key="bt_clear")
 
     if clear_bt:
         st.session_state["bt_detail"] = None
@@ -1132,7 +1471,6 @@ with tab3:
         st.rerun()
 
     def _make_bt_signature():
-        """計算条件の署名（これが変わったら再実行推奨）"""
         try:
             top_ns_sig = tuple(int(x) for x in top_ns)
         except Exception:
@@ -1148,10 +1486,9 @@ with tab3:
             machines_sig,
             int(lookback_days), int(tau), int(min_unique_days),
             float(w_unit), float(w_island), float(w_run), float(w_end),
-            int(min_games), float(max_rb), float(max_gassan),
+            int(morning_min_games), float(morning_max_rb), float(morning_max_gassan),
         )
 
-    # 実行時に計算して保存
     if run_bt:
         detail, overall_df, per_machine_df = backtest_precision_hit(
             df_all=df_all_shared,
@@ -1164,14 +1501,13 @@ with tab3:
             w_island=float(w_island),
             w_run=float(w_run),
             w_end=float(w_end),
-            min_games_fallback=int(min_games),
-            max_rb_fallback=float(max_rb),
-            max_gassan_fallback=float(max_gassan),
+            min_games_fallback=int(morning_min_games),
+            max_rb_fallback=float(morning_max_rb),
+            max_gassan_fallback=float(morning_max_gassan),
             top_ns=top_ns,
             eval_start=eval_start,
             eval_end=eval_end,
         )
-
         if detail is None:
             st.error("バックテスト結果が生成できませんでした（評価期間が短い / サンプル不足 / データ欠損の可能性）。")
             st.stop()
@@ -1181,7 +1517,6 @@ with tab3:
         st.session_state["bt_per_machine"] = per_machine_df
         st.session_state["bt_sig"] = _make_bt_signature()
 
-    # 保存済み結果を読む（UI操作でrerunしても残る）
     detail = st.session_state["bt_detail"]
     overall_df = st.session_state["bt_overall"]
     per_machine_df = st.session_state["bt_per_machine"]
@@ -1190,14 +1525,11 @@ with tab3:
         st.info("まだバックテストが未実行です。上の『バックテストを実行』を押してください。")
         st.stop()
 
-    # 条件変更検知：結果が「前回条件のまま」なら警告だけ出す（表示は消さない）
     cur_sig = _make_bt_signature()
     if st.session_state["bt_sig"] is not None and st.session_state["bt_sig"] != cur_sig:
         st.warning("⚠️ 計算条件が変更されています。表示中の結果は『前回実行時の条件』のものです。必要なら再度『バックテストを実行』してください。")
 
-    # -----------------------------
-    # 3) サマリ表示（全体）
-    # -----------------------------
+    # --- 全体サマリ ---
     overall_show = overall_df.copy()
     for c in ["precision_topN", "baseline_good_rate", "lift_pt", "hit_rate"]:
         overall_show[c] = pd.to_numeric(overall_show[c], errors="coerce")
@@ -1219,14 +1551,11 @@ with tab3:
         bN = int(best["topN"].iloc[0])
         st.success(f"liftが最大のTopN：**Top{bN}**（lift={best['lift_pt(%pt)'].iloc[0]}%pt / Hit={best['hit_rate(%)'].iloc[0]}%）")
 
-    # -----------------------------
-    # 4) サマリ表示（機種別）
-    # -----------------------------
+    # --- 機種別サマリ ---
     st.subheader("結果サマリ（機種別）")
     pm = per_machine_df.copy()
     for c in ["precision_topN", "baseline_good_rate", "lift_pt", "hit_rate"]:
         pm[c] = pd.to_numeric(pm[c], errors="coerce")
-
     pm["precision_topN(%)"] = (pm["precision_topN"] * 100).round(1)
     pm["baseline_good_rate(%)"] = (pm["baseline_good_rate"] * 100).round(1)
     pm["lift_pt(%pt)"] = (pm["lift_pt"] * 100).round(1)
@@ -1238,9 +1567,7 @@ with tab3:
         hide_index=True
     )
 
-    # -----------------------------
-    # 5) 詳細（day × machine × topN）
-    # -----------------------------
+    # --- 詳細 ---
     st.subheader("詳細（day × machine × topN）")
     det = detail.copy()
     det["date"] = pd.to_datetime(det["date"], errors="coerce").dt.date
@@ -1255,22 +1582,13 @@ with tab3:
     )
 
     # ============================================================
-    # 6) 外れ日分析（特定の日に外れやすいかを見る）
+    # 外れ日分析（日毎のTopN lift_ptを表示する表：残してあります）
     # ============================================================
     st.divider()
     st.subheader("外れ日分析（特定の日に外れやすいかを見る）")
 
     topN_options = sorted(det["topN"].dropna().unique().astype(int).tolist())
-    if not topN_options:
-        st.info("TopNの結果がありません。")
-        st.stop()
-
-    N_focus = st.selectbox(
-        "外れ日ランキングの対象TopN",
-        options=topN_options,
-        index=0,
-        key="bt_focus_topN_view"
-    )
+    N_focus = st.selectbox("外れ日ランキングの対象TopN", options=topN_options, index=0, key="bt_focus_topN_view")
 
     detN = det[det["topN"] == int(N_focus)].copy()
 
@@ -1341,7 +1659,7 @@ with tab3:
         )
 
     # ============================================================
-    # 7) 日別ヒートマップ（date × topN の lift_pt）※全機種平均（機種を合算）
+    # 日別ヒートマップ（date × topN の lift）全機種合算
     # ============================================================
     st.divider()
     st.subheader("日別ヒートマップ（date × topN の lift）")
@@ -1349,10 +1667,8 @@ with tab3:
 
     det2 = detail.copy()
     det2["date"] = pd.to_datetime(det2["date"], errors="coerce").dt.date
-
     for c in ["selected_n", "good_in_topN", "all_units_n", "good_all", "topN"]:
         det2[c] = pd.to_numeric(det2[c], errors="coerce")
-
     det2["selected_n"] = det2["selected_n"].fillna(0).astype(int)
     det2["good_in_topN"] = det2["good_in_topN"].fillna(0).astype(int)
     det2["all_units_n"] = det2["all_units_n"].fillna(0).astype(int)
@@ -1363,11 +1679,9 @@ with tab3:
         sel = int(g["selected_n"].sum())
         good_sel = int(g["good_in_topN"].sum())
         precision = (good_sel / sel) if sel > 0 else np.nan
-
         alln = int(g["all_units_n"].sum())
         good_all = int(g["good_all"].sum())
         baseline = (good_all / alln) if alln > 0 else np.nan
-
         lift = (precision - baseline) if (pd.notna(precision) and pd.notna(baseline)) else np.nan
         return pd.Series({"lift_pt": lift})
 
@@ -1405,70 +1719,10 @@ with tab3:
     )
 
     # ============================================================
-    # 7B) 追加：機種別ヒートマップ（date × topN の lift_pt）
-    # ============================================================
-    st.divider()
-    st.subheader("機種別：日別TopN lift（date × topN）")
-    st.caption("機種を選ぶと、その機種だけの lift ヒートマップ（date × topN）を表示します。")
-
-    machines_in_detail = sorted(det2["machine"].dropna().unique().tolist())
-    if not machines_in_detail:
-        st.info("詳細に機種情報がありません。")
-        pivot_m = None
-    else:
-        m_focus = st.selectbox(
-            "表示する機種",
-            options=machines_in_detail,
-            index=0,
-            key="bt_heatmap_machine_focus"
-        )
-
-        detm = det2[det2["machine"] == m_focus].copy()
-
-        day_topN_m = (
-            detm.dropna(subset=["date"])
-            .groupby(["date", "topN"], dropna=False)
-            .apply(_day_topN_agg)
-            .reset_index()
-        )
-        day_topN_m["lift_pt(%pt)"] = (pd.to_numeric(day_topN_m["lift_pt"], errors="coerce") * 100).round(1)
-
-        pivot_m = day_topN_m.pivot_table(index="date", columns="topN", values="lift_pt(%pt)", aggfunc="mean")
-
-        show_last_m = st.number_input(
-            "直近何日を表示する？（0なら全日）",
-            min_value=0, max_value=9999, value=60, step=10,
-            key="bt_heatmap_last_days_machine_view"
-        )
-        pivot_m2 = pivot_m.copy()
-        if int(show_last_m) > 0 and len(pivot_m2) > int(show_last_m):
-            pivot_m2 = pivot_m2.tail(int(show_last_m))
-
-        st.markdown(f"#### ヒートマップ（機種別：{m_focus}）")
-        try:
-            st.dataframe(
-                pivot_m2.style.format("{:.1f}").background_gradient(axis=None, cmap="RdYlGn"),
-                use_container_width=True
-            )
-        except Exception:
-            st.dataframe(pivot_m2, use_container_width=True)
-
-        safe_m = str(m_focus).replace(" ", "").replace("/", "_").replace("\\", "_").replace(":", "-")
-        st.download_button(
-            f"機種別ヒートマップ（{m_focus} pivot CSV）をダウンロード",
-            data=pivot_m.to_csv().encode("utf-8-sig"),
-            file_name=f"{date_str}_lift_heatmap_pivot_{safe_m}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="bt_dl_heatmap_machine"
-        )
-
-    # ============================================================
-    # 8) ダウンロード（まとめてZIP / 個別CSV）
+    # ダウンロード（まとめてZIP）
     # ============================================================
     st.divider()
     st.subheader("バックテスト結果のダウンロード")
-
     dl_zip = st.checkbox("詳細・サマリ・外れ日・ヒートマップをzipでまとめてDL", value=True, key="bt_dl_zip")
     if dl_zip:
         mem = io.BytesIO()
@@ -1478,8 +1732,6 @@ with tab3:
             z.writestr(f"{date_str}_bt_detail.csv", detail.to_csv(index=False).encode("utf-8-sig"))
             z.writestr(f"{date_str}_bt_bad_days_top{int(N_focus)}.csv", (bad_days.to_csv(index=False).encode("utf-8-sig") if (bad_days is not None and not bad_days.empty) else b""))
             z.writestr(f"{date_str}_bt_lift_heatmap_pivot.csv", pivot.to_csv().encode("utf-8-sig"))
-            if pivot_m is not None:
-                z.writestr(f"{date_str}_bt_lift_heatmap_pivot_machine.csv", pivot_m.to_csv().encode("utf-8-sig"))
 
         st.download_button(
             "バックテスト結果（zip）をダウンロード",
@@ -1531,12 +1783,3 @@ with tab3:
             use_container_width=True,
             key="bt_dl_heatmap2"
         )
-        if pivot_m is not None:
-            st.download_button(
-                "heatmap_pivot（機種別）をCSVでDL",
-                data=pivot_m.to_csv().encode("utf-8-sig"),
-                file_name=f"{date_str}_bt_lift_heatmap_pivot_machine.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="bt_dl_heatmap_machine2"
-            )
