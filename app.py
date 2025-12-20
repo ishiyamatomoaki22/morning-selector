@@ -68,6 +68,9 @@ RECOMMENDED_EVENING = {
 # ============================================================
 # ★追加：曜日×台番 ペカ傾向分析
 # ============================================================
+# ============================================================
+# ★追加：曜日×台番 ペカ傾向分析（強化版：median / weighted / ばらつき）
+# ============================================================
 WEEKDAY_ORDER_JA = ["月", "火", "水", "木", "金", "土", "日"]
 
 def compute_weekday_pekari_trends(
@@ -80,10 +83,11 @@ def compute_weekday_pekari_trends(
     min_samples_per_cell: int = 5,
 ):
     """
-    曜日×台番の「1000回転あたりペカ回数」と「台番平均との差（残差）」を作る
-    - df_all: unified（過去統合）想定。BASE_HEADER準拠だと安全。
-    - min_total_start: 低回転のブレを避けるための下限（任意）
-    - min_samples_per_cell: サンプル不足セルは NaN にして誤認防止
+    曜日×台番の指標を作る（既存の平均に加えて、中央値・重み付き平均・ばらつきを追加）
+    - pekari_per_1000: (BB+RB)/total_start * 1000
+    - weighted_pekari_per_1000: Σ(BB+RB)/Σ(total_start) * 1000  ※回転数で重み付け
+    - residual: 台番平均との差（mean/median/weighted）
+    - std / IQR: ブレの大きさ
     """
     if df_all is None or df_all.empty:
         return None
@@ -106,10 +110,9 @@ def compute_weekday_pekari_trends(
 
     for c in ["total_start", "bb_count", "rb_count"]:
         work[c] = pd.to_numeric(work[c], errors="coerce")
-
     work = work.dropna(subset=["total_start", "bb_count", "rb_count"]).copy()
 
-    # フィルタ（任意）
+    # フィルタ
     if shop:
         work = work[work["shop"] == shop].copy()
     if machine:
@@ -119,15 +122,15 @@ def compute_weekday_pekari_trends(
     if date_end is not None:
         work = work[work["date"] <= date_end].copy()
 
-    # 低回転を除外（任意）
+    # 低回転除外
     work = work[work["total_start"] >= int(min_total_start)].copy()
     if work.empty:
         return None
 
-    # weekday の正規化（念のため）
+    # weekday 正規化
     work["weekday"] = work["weekday"].astype(str).str.strip()
 
-    # 指標：1000回転あたりペカ回数
+    # 1000回転あたりペカ
     work["bonus_total"] = work["bb_count"].fillna(0) + work["rb_count"].fillna(0)
     work["pekari_per_1000"] = np.where(
         work["total_start"] > 0,
@@ -135,46 +138,115 @@ def compute_weekday_pekari_trends(
         np.nan
     )
 
-    # 台番平均との差（残差）
-    unit_avg = work.groupby("unit_number")["pekari_per_1000"].mean()
-    work["unit_avg"] = work["unit_number"].map(unit_avg)
-    work["residual"] = work["pekari_per_1000"] - work["unit_avg"]
+    # ==============
+    # 台番の基礎（mean / median / weighted）
+    # ==============
+    unit_mean = work.groupby("unit_number")["pekari_per_1000"].mean()
+    unit_median = work.groupby("unit_number")["pekari_per_1000"].median()
 
-    # ピボット
-    pivot_pekari = work.pivot_table(
-        index="unit_number",
-        columns="weekday",
-        values="pekari_per_1000",
-        aggfunc="mean"
+    unit_sum = work.groupby("unit_number").agg(
+        sum_bonus=("bonus_total", "sum"),
+        sum_total=("total_start", "sum"),
     )
-    pivot_resid = work.pivot_table(
-        index="unit_number",
-        columns="weekday",
-        values="residual",
-        aggfunc="mean"
-    )
+    unit_wmean = (unit_sum["sum_bonus"] / unit_sum["sum_total"] * 1000.0).replace([np.inf, -np.inf], np.nan)
+
+    work["unit_mean"] = work["unit_number"].map(unit_mean)
+    work["unit_median"] = work["unit_number"].map(unit_median)
+    work["unit_wmean"] = work["unit_number"].map(unit_wmean)
+
+    # 残差（行単位）
+    work["residual_mean"] = work["pekari_per_1000"] - work["unit_mean"]
+    work["residual_median"] = work["pekari_per_1000"] - work["unit_median"]
+    # weighted 残差は “集計後に” 作る（pivot_pekari_wmean - unit_wmean）
+
+    # ==============
+    # ピボット作成
+    # ==============
+    # 件数
     pivot_n = work.pivot_table(
-        index="unit_number",
-        columns="weekday",
-        values="pekari_per_1000",
-        aggfunc="count"
-    )
+        index="unit_number", columns="weekday", values="pekari_per_1000", aggfunc="count"
+    ).reindex(columns=WEEKDAY_ORDER_JA)
 
-    # 曜日順
-    pivot_pekari = pivot_pekari.reindex(columns=WEEKDAY_ORDER_JA)
-    pivot_resid = pivot_resid.reindex(columns=WEEKDAY_ORDER_JA)
-    pivot_n = pivot_n.reindex(columns=WEEKDAY_ORDER_JA)
+    # 既存互換：平均
+    pivot_pekari = work.pivot_table(
+        index="unit_number", columns="weekday", values="pekari_per_1000", aggfunc="mean"
+    ).reindex(columns=WEEKDAY_ORDER_JA)
 
-    # サンプル不足セルはNaN化
-    pivot_pekari = pivot_pekari.mask(pivot_n < int(min_samples_per_cell))
-    pivot_resid = pivot_resid.mask(pivot_n < int(min_samples_per_cell))
+    pivot_resid = work.pivot_table(
+        index="unit_number", columns="weekday", values="residual_mean", aggfunc="mean"
+    ).reindex(columns=WEEKDAY_ORDER_JA)
+
+    # 追加：中央値
+    pivot_pekari_median = work.pivot_table(
+        index="unit_number", columns="weekday", values="pekari_per_1000", aggfunc="median"
+    ).reindex(columns=WEEKDAY_ORDER_JA)
+
+    pivot_resid_median = work.pivot_table(
+        index="unit_number", columns="weekday", values="residual_median", aggfunc="median"
+    ).reindex(columns=WEEKDAY_ORDER_JA)
+
+    # 追加：重み付き平均（Σボーナス/Σ回転）
+    grp = work.groupby(["unit_number", "weekday"], dropna=False).agg(
+        sum_bonus=("bonus_total", "sum"),
+        sum_total=("total_start", "sum"),
+    ).reset_index()
+    grp["pekari_wmean"] = (grp["sum_bonus"] / grp["sum_total"] * 1000.0).replace([np.inf, -np.inf], np.nan)
+
+    pivot_pekari_wmean = grp.pivot(
+        index="unit_number", columns="weekday", values="pekari_wmean"
+    ).reindex(columns=WEEKDAY_ORDER_JA)
+
+    # 追加：weighted 残差（台番のweighted平均との差）
+    # pivot_pekari_wmean から unit_wmean を引く（indexで自動align）
+    pivot_resid_wmean = pivot_pekari_wmean.sub(unit_wmean, axis=0)
+
+    # 追加：ブレ（std / IQR）
+    pivot_pekari_std = work.pivot_table(
+        index="unit_number", columns="weekday", values="pekari_per_1000", aggfunc="std"
+    ).reindex(columns=WEEKDAY_ORDER_JA)
+
+    q75 = work.pivot_table(
+        index="unit_number", columns="weekday", values="pekari_per_1000", aggfunc=lambda s: float(np.nanpercentile(s, 75))
+    ).reindex(columns=WEEKDAY_ORDER_JA)
+    q25 = work.pivot_table(
+        index="unit_number", columns="weekday", values="pekari_per_1000", aggfunc=lambda s: float(np.nanpercentile(s, 25))
+    ).reindex(columns=WEEKDAY_ORDER_JA)
+    pivot_pekari_iqr = (q75 - q25)
+
+    # サンプル不足セルはNaN化（既存・追加すべてに適用）
+    nmask = pivot_n < int(min_samples_per_cell)
+
+    def _mask(pv: pd.DataFrame) -> pd.DataFrame:
+        if pv is None:
+            return pv
+        return pv.mask(nmask)
+
+    pivot_pekari = _mask(pivot_pekari)
+    pivot_resid = _mask(pivot_resid)
+    pivot_pekari_median = _mask(pivot_pekari_median)
+    pivot_resid_median = _mask(pivot_resid_median)
+    pivot_pekari_wmean = _mask(pivot_pekari_wmean)
+    pivot_resid_wmean = _mask(pivot_resid_wmean)
+    pivot_pekari_std = _mask(pivot_pekari_std)
+    pivot_pekari_iqr = _mask(pivot_pekari_iqr)
 
     return {
         "work": work,
+
+        # 既存キー（互換維持）
         "pivot_pekari": pivot_pekari,
         "pivot_residual": pivot_resid,
         "pivot_n": pivot_n,
+
+        # 追加キー
+        "pivot_pekari_median": pivot_pekari_median,
+        "pivot_residual_median": pivot_resid_median,
+        "pivot_pekari_wmean": pivot_pekari_wmean,
+        "pivot_residual_wmean": pivot_resid_wmean,
+        "pivot_pekari_std": pivot_pekari_std,
+        "pivot_pekari_iqr": pivot_pekari_iqr,
     }
+
 
 
 def add_weekday_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -1951,6 +2023,13 @@ with tab_weektrend:
             pivot_pekari = res["pivot_pekari"].copy()
             pivot_resid = res["pivot_residual"].copy()
             pivot_n = res["pivot_n"].copy()
+            pivot_pekari_median = res.get("pivot_pekari_median")
+            pivot_resid_median  = res.get("pivot_residual_median")
+            pivot_pekari_wmean  = res.get("pivot_pekari_wmean")
+            pivot_resid_wmean   = res.get("pivot_residual_wmean")
+            pivot_pekari_std    = res.get("pivot_pekari_std")
+            pivot_pekari_iqr    = res.get("pivot_pekari_iqr")
+
 
             st.divider()
             st.markdown("### ① 1000回転あたりペカ回数（平均）")
@@ -1963,14 +2042,64 @@ with tab_weektrend:
             st.markdown("### ③ サンプル数（件数）")
             st.dataframe(pivot_n, use_container_width=True)
 
+            # 追加：頑健指標（外れ値に強い）
+            with st.expander("（強化）外れ値に強い指標：中央値 / 重み付き平均 / ブレ", expanded=False):
+                st.markdown("#### ① 中央値（median）：外れ値に引っ張られにくい")
+                if pivot_pekari_median is not None:
+                    st.dataframe(pivot_pekari_median.round(3), use_container_width=True)
+
+                st.markdown("#### ② 重み付き平均（weighted）：回転数が多い日の比重を高く（Σボーナス/Σ回転）")
+                if pivot_pekari_wmean is not None:
+                    st.dataframe(pivot_pekari_wmean.round(3), use_container_width=True)
+
+                st.markdown("#### ③ 残差（median / weighted）：その曜日に“台として”強いか")
+                cA, cB = st.columns(2)
+                with cA:
+                    if pivot_resid_median is not None:
+                        st.caption("median残差（中央値ベース）")
+                        st.dataframe(pivot_resid_median.round(3), use_container_width=True)
+                with cB:
+                    if pivot_resid_wmean is not None:
+                        st.caption("weighted残差（回転加重ベース）")
+                        st.dataframe(pivot_resid_wmean.round(3), use_container_width=True)
+
+                st.markdown("#### ④ ブレ指標：std / IQR（大きいほど“荒い”）")
+                cC, cD = st.columns(2)
+                with cC:
+                    if pivot_pekari_std is not None:
+                        st.caption("標準偏差（std）")
+                        st.dataframe(pivot_pekari_std.round(3), use_container_width=True)
+                with cD:
+                    if pivot_pekari_iqr is not None:
+                        st.caption("四分位範囲（IQR=Q75-Q25）")
+                        st.dataframe(pivot_pekari_iqr.round(3), use_container_width=True)
+
+
             # 曜日別 Top（残差）
             st.divider()
             st.markdown("### ④ 曜日別：残差Top（“その曜日に浮きやすい台”）")
+            # Top抽出の基準（デフォルトは従来通り mean残差）
+            metric_mode = st.selectbox(
+                "Top抽出の基準（デフォルト=mean残差）",
+                options=["mean残差", "median残差", "weighted残差"],
+                index=0,
+                key="trend_metric_mode"
+            )
+
+            if metric_mode == "mean残差":
+                base_pivot = pivot_resid
+            elif metric_mode == "median残差" and pivot_resid_median is not None:
+                base_pivot = pivot_resid_median
+            elif metric_mode == "weighted残差" and pivot_resid_wmean is not None:
+                base_pivot = pivot_resid_wmean
+            else:
+                base_pivot = pivot_resid
+
             weekday_pick = st.selectbox("曜日を選択", WEEKDAY_ORDER_JA, index=0, key="trend_weekday_pick")
 
-            if weekday_pick in pivot_resid.columns:
+            if weekday_pick in base_pivot.columns:
                 top_df = (
-                    pivot_resid[[weekday_pick]]
+                    base_pivot[[weekday_pick]]
                     .dropna()
                     .rename(columns={weekday_pick: "residual"})
                     .sort_values("residual", ascending=False)
