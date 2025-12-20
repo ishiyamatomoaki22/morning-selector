@@ -65,7 +65,117 @@ RECOMMENDED_EVENING = {
 # ============================================================
 # Helpers（共通）
 # ============================================================
-JP_WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
+# ============================================================
+# ★追加：曜日×台番 ペカ傾向分析
+# ============================================================
+WEEKDAY_ORDER_JA = ["月", "火", "水", "木", "金", "土", "日"]
+
+def compute_weekday_pekari_trends(
+    df_all: pd.DataFrame,
+    shop: str | None = None,
+    machine: str | None = None,
+    date_start: date | None = None,
+    date_end: date | None = None,
+    min_total_start: int = 1000,
+    min_samples_per_cell: int = 5,
+):
+    """
+    曜日×台番の「1000回転あたりペカ回数」と「台番平均との差（残差）」を作る
+    - df_all: unified（過去統合）想定。BASE_HEADER準拠だと安全。
+    - min_total_start: 低回転のブレを避けるための下限（任意）
+    - min_samples_per_cell: サンプル不足セルは NaN にして誤認防止
+    """
+    if df_all is None or df_all.empty:
+        return None
+
+    work = df_all.copy()
+
+    # 必須列
+    required = ["date", "weekday", "shop", "machine", "unit_number", "total_start", "bb_count", "rb_count"]
+    missing = [c for c in required if c not in work.columns]
+    if missing:
+        raise ValueError(f"曜日×台番分析に必要な列が不足しています: {missing}")
+
+    # 型整備
+    work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.date
+    work = work[work["date"].notna()].copy()
+
+    work["unit_number"] = pd.to_numeric(work["unit_number"], errors="coerce")
+    work = work[work["unit_number"].notna()].copy()
+    work["unit_number"] = work["unit_number"].astype(int)
+
+    for c in ["total_start", "bb_count", "rb_count"]:
+        work[c] = pd.to_numeric(work[c], errors="coerce")
+
+    work = work.dropna(subset=["total_start", "bb_count", "rb_count"]).copy()
+
+    # フィルタ（任意）
+    if shop:
+        work = work[work["shop"] == shop].copy()
+    if machine:
+        work = work[work["machine"] == machine].copy()
+    if date_start is not None:
+        work = work[work["date"] >= date_start].copy()
+    if date_end is not None:
+        work = work[work["date"] <= date_end].copy()
+
+    # 低回転を除外（任意）
+    work = work[work["total_start"] >= int(min_total_start)].copy()
+    if work.empty:
+        return None
+
+    # weekday の正規化（念のため）
+    work["weekday"] = work["weekday"].astype(str).str.strip()
+
+    # 指標：1000回転あたりペカ回数
+    work["bonus_total"] = work["bb_count"].fillna(0) + work["rb_count"].fillna(0)
+    work["pekari_per_1000"] = np.where(
+        work["total_start"] > 0,
+        work["bonus_total"] / work["total_start"] * 1000.0,
+        np.nan
+    )
+
+    # 台番平均との差（残差）
+    unit_avg = work.groupby("unit_number")["pekari_per_1000"].mean()
+    work["unit_avg"] = work["unit_number"].map(unit_avg)
+    work["residual"] = work["pekari_per_1000"] - work["unit_avg"]
+
+    # ピボット
+    pivot_pekari = work.pivot_table(
+        index="unit_number",
+        columns="weekday",
+        values="pekari_per_1000",
+        aggfunc="mean"
+    )
+    pivot_resid = work.pivot_table(
+        index="unit_number",
+        columns="weekday",
+        values="residual",
+        aggfunc="mean"
+    )
+    pivot_n = work.pivot_table(
+        index="unit_number",
+        columns="weekday",
+        values="pekari_per_1000",
+        aggfunc="count"
+    )
+
+    # 曜日順
+    pivot_pekari = pivot_pekari.reindex(columns=WEEKDAY_ORDER_JA)
+    pivot_resid = pivot_resid.reindex(columns=WEEKDAY_ORDER_JA)
+    pivot_n = pivot_n.reindex(columns=WEEKDAY_ORDER_JA)
+
+    # サンプル不足セルはNaN化
+    pivot_pekari = pivot_pekari.mask(pivot_n < int(min_samples_per_cell))
+    pivot_resid = pivot_resid.mask(pivot_n < int(min_samples_per_cell))
+
+    return {
+        "work": work,
+        "pivot_pekari": pivot_pekari,
+        "pivot_residual": pivot_resid,
+        "pivot_n": pivot_n,
+    }
+
 
 def add_weekday_column(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -73,7 +183,7 @@ def add_weekday_column(df: pd.DataFrame) -> pd.DataFrame:
         out["date"] = pd.NaT
     dt = pd.to_datetime(out["date"], errors="coerce")
     wd = dt.dt.dayofweek  # 0=Mon
-    out["weekday"] = wd.map(lambda x: JP_WEEKDAYS[int(x)] if pd.notna(x) else np.nan)
+    out["weekday"] = wd.map(lambda x: WEEKDAY_ORDER_JA[int(x)] if pd.notna(x) else np.nan)
     return out
 
 def parse_rate_token(tok: str) -> float:
@@ -1058,14 +1168,16 @@ def upload_past_data_ui():
 # ============================================================
 # Main Tabs
 # ============================================================
-tab_common, tab_morning, tab_evening_in, tab_evening_pick, tab_log, tab_bt = st.tabs([
+tab_common, tab_morning, tab_evening_in, tab_evening_pick, tab_log, tab_bt, tab_weektrend = st.tabs([
     "共通：データ統合 / 島マスタ",
     "朝イチ：候補ランキング",
     "夕方：入力→変換（統一CSV作成）",
     "夕方：続行候補（判定）",
     "実戦ログ（統合）",
     "バックテスト（朝イチ精度）",
+    "曜日×台番：ペカ傾向（回転補正）",
 ])
+
 
 # -------- 共通：統合データ & 島マスタ --------
 with tab_common:
@@ -1462,7 +1574,7 @@ with tab_log:
             st.error("先に「追記したいログCSV」を選択してください。")
         else:
             dt = pd.to_datetime(log_date, errors="coerce")
-            wd = JP_WEEKDAYS[int(dt.dayofweek)] if pd.notna(dt) else ""
+            wd = WEEKDAY_ORDER_JA[int(dt.dayofweek)] if pd.notna(dt) else ""
 
             tool_logic = st.session_state.get("log_logic", tool_logic_default)
 
@@ -1774,3 +1886,123 @@ with tab_bt:
                     mime="text/csv",
                     key="bt_daily_lift_dl"
                 )
+
+# -------- 曜日×台番：ペカ傾向（回転補正） --------
+with tab_weektrend:
+    st.subheader("曜日×台番：ペカ傾向（回転数補正 + 台平均差分）")
+    st.caption("※ ペカ回数そのままではなく『1000回転あたりペカ回数』で比較し、さらに台番ご平均との差（残差）で“曜日クセ”を見ます。")
+
+    df_all_shared = st.session_state.get("df_all_shared", pd.DataFrame(columns=BASE_HEADER))
+    if df_all_shared.empty:
+        st.info("過去データが未投入です。『共通：データ統合』で過去CSV/zipを入れると分析できます。")
+    else:
+        # 対象期間（データ範囲から自動）
+        dt_series = pd.to_datetime(df_all_shared["date"], errors="coerce").dt.date
+        dt_series = dt_series[dt_series.notna()]
+        min_day = dt_series.min() if len(dt_series) else date.today()
+        max_day = dt_series.max() if len(dt_series) else date.today()
+
+        c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+        with c1:
+            trend_shop = st.selectbox(
+                "対象 shop",
+                options=sorted(df_all_shared["shop"].dropna().unique().tolist()),
+                index=0 if shop not in sorted(df_all_shared["shop"].dropna().unique().tolist()) else sorted(df_all_shared["shop"].dropna().unique().tolist()).index(shop),
+                key="trend_shop"
+            )
+        with c2:
+            machines_in_shop = sorted(df_all_shared[df_all_shared["shop"] == trend_shop]["machine"].dropna().unique().tolist())
+            trend_machine = st.selectbox(
+                "対象 machine",
+                options=machines_in_shop if machines_in_shop else sorted(df_all_shared["machine"].dropna().unique().tolist()),
+                index=0 if machine not in (machines_in_shop if machines_in_shop else []) else (machines_in_shop.index(machine) if machines_in_shop else 0),
+                key="trend_machine"
+            )
+        with c3:
+            trend_start = st.date_input("期間（開始）", value=min_day, min_value=min_day, max_value=max_day, key="trend_start")
+        with c4:
+            trend_end = st.date_input("期間（終了）", value=max_day, min_value=min_day, max_value=max_day, key="trend_end")
+
+        c5, c6, c7 = st.columns([2, 2, 2])
+        with c5:
+            min_total_start = st.number_input("最低総回転（total_start）下限", 0, 20000, 1000, 100, key="trend_min_total")
+        with c6:
+            min_samples = st.number_input("曜日セルの最低サンプル数（未満は非表示）", 1, 60, 5, 1, key="trend_min_samples")
+        with c7:
+            topk = st.number_input("曜日別Top表示件数（残差）", 1, 200, 20, 1, key="trend_topk")
+
+        try:
+            res = compute_weekday_pekari_trends(
+                df_all=df_all_shared,
+                shop=str(trend_shop),
+                machine=str(trend_machine),
+                date_start=trend_start,
+                date_end=trend_end,
+                min_total_start=int(min_total_start),
+                min_samples_per_cell=int(min_samples),
+            )
+        except Exception as e:
+            st.error(str(e))
+            res = None
+
+        if res is None:
+            st.warning("条件に合うデータがありません（期間/回転数/サンプル数を見直してください）。")
+        else:
+            pivot_pekari = res["pivot_pekari"].copy()
+            pivot_resid = res["pivot_residual"].copy()
+            pivot_n = res["pivot_n"].copy()
+
+            st.divider()
+            st.markdown("### ① 1000回転あたりペカ回数（平均）")
+            st.dataframe(pivot_pekari.round(3), use_container_width=True)
+
+            st.markdown("### ② 台番平均との差（残差）")
+            st.caption("プラスほど『その曜日に強い傾向』。マイナスは弱い傾向。")
+            st.dataframe(pivot_resid.round(3), use_container_width=True)
+
+            st.markdown("### ③ サンプル数（件数）")
+            st.dataframe(pivot_n, use_container_width=True)
+
+            # 曜日別 Top（残差）
+            st.divider()
+            st.markdown("### ④ 曜日別：残差Top（“その曜日に浮きやすい台”）")
+            weekday_pick = st.selectbox("曜日を選択", WEEKDAY_ORDER_JA, index=0, key="trend_weekday_pick")
+
+            if weekday_pick in pivot_resid.columns:
+                top_df = (
+                    pivot_resid[[weekday_pick]]
+                    .dropna()
+                    .rename(columns={weekday_pick: "residual"})
+                    .sort_values("residual", ascending=False)
+                    .head(int(topk))
+                    .reset_index()
+                )
+                st.dataframe(top_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("選択した曜日の列がありません（データ不足の可能性）。")
+
+            # ダウンロード
+            st.divider()
+            st.markdown("### ダウンロード")
+            dl_base = f"{date_str}_{trend_shop}_{trend_machine}_weekday_trend"
+            st.download_button(
+                "pekari_per_1000（pivot）をCSVでダウンロード",
+                data=to_csv_bytes(pivot_pekari.reset_index()),
+                file_name=f"{dl_base}_pekari_per_1000.csv",
+                mime="text/csv",
+                key="trend_dl_pekari"
+            )
+            st.download_button(
+                "residual（pivot）をCSVでダウンロード",
+                data=to_csv_bytes(pivot_resid.reset_index()),
+                file_name=f"{dl_base}_residual.csv",
+                mime="text/csv",
+                key="trend_dl_resid"
+            )
+            st.download_button(
+                "samples（pivot）をCSVでダウンロード",
+                data=to_csv_bytes(pivot_n.reset_index()),
+                file_name=f"{dl_base}_samples.csv",
+                mime="text/csv",
+                key="trend_dl_samples"
+            )
